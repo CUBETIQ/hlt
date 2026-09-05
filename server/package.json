@@ -4,8 +4,8 @@
   "description": "A lightweight http tunnel server using nodejs and socket.io server.",
   "main": "server.js",
   "scripts": {
-    "start": "node cluster.js",
-    "server": "node server.js",
+    "start": "bun cluster.js",
+    "server": "bun server.js",
     "test": "echo \"Hello Tests\""
   },
   "repository": {
@@ -14,21 +14,22 @@
   },
   "keywords": [
     "http-tunnel-server",
-    "socket.io"
+    "socket.io",
+    "bun"
   ],
   "author": "Sambo Chea <sombochea@cubis.tech>",
   "license": "ISC",
   "dependencies": {
     "@socket.io/admin-ui": "^0.5.1",
     "@socket.io/redis-adapter": "^8.3.0",
-    "body-parser": "^2.3.0",
-    "dotenv": "^17.4.2",
-    "express": "^5.2.1",
-    "jsonwebtoken": "^9.0.3",
-    "morgan": "^1.12.0",
-    "redis": "^6.2.1",
-    "socket.io": "^4.8.3",
-    "uuid": "^14.0.2",
-    "winston": "^3.19.0"
+    "body-parser": "^1.20.3",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "redis": "^4.7.0",
+    "socket.io": "^4.8.1",
+    "uuid": "^11.1.0",
+    "winston": "^3.17.0"
   }
 }

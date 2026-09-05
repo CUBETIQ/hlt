@@ -29,7 +29,7 @@ services:
       - ADMIN_AUTH_USERNAME=${ADMIN_AUTH_USERNAME:-admin}
       - ADMIN_AUTH_PASSWORD=${ADMIN_AUTH_PASSWORD:-$$2b$$10$$uLYLbhGW7OnWW6mRye15puPrwzfvSe/WtDLSz8GdLw6FYHxaNlqb2}
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/_/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1); }).on('error', () => process.exit(1));"]
+      test: ["CMD", "bun", "-e", "require('http').get('http://127.0.0.1:3000/_/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1); }).on('error', () => process.exit(1));"]
       interval: 30s
       timeout: 5s
       retries: 3

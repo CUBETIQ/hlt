@@ -21,22 +21,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
         with:
-          node-version: 20
-          registry-url: "https://registry.npmjs.org"
+          bun-version: latest
 
       - name: Install dependencies
         working-directory: ./client
-        run: npm ci
+        run: bun install
 
       - name: Build client
         working-directory: ./client
-        run: npm run build
+        run: bun run build
+
+      - name: Set up NPM auth token
+        run: echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > ~/.npmrc
 
       - name: Publish to NPM
         working-directory: ./client
-        run: npm publish --access public --tag ${{ github.event.inputs.tag || 'latest' }}
+        run: bun publish --access public --tag ${{ github.event.inputs.tag || 'latest' }} || npm publish --access public --tag ${{ github.event.inputs.tag || 'latest' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
