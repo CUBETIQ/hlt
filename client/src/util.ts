@@ -9,6 +9,12 @@ const addPrefixOnHttpSchema = (url: string, prefixDomain: string) => {
   //   prefixSubDomain = `${prefixSubDomain}.`;
   // }
 
+  // If server's url is localhost (host with any port)
+  if (splitDomain.startsWith("localhost") && prefixSubDomain.endsWith("-")) {
+    // remove '-' from prefixSubDomain and replace with '.'
+    prefixSubDomain = prefixSubDomain.substring(0, prefixSubDomain.length - 1) + ".";
+  }
+
   return `${prefixSchema}${prefixSubDomain}${splitDomain}`;
 };
 

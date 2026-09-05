@@ -45,7 +45,9 @@ jobs:
         working-directory: ./client
         run: bun install
 
-      - name: Build client
+      - name: Build & Test client
         working-directory: ./client
-        run: bun run build
+        run: |
+          bun run build
+          bun run test
 

@@ -1,16 +1,18 @@
 {
     "compilerOptions": {
-        "lib": ["ES2015"],
-        "target": "es5",
-
+        "lib": ["ES2022"],
+        "target": "ES2022",
         "module": "commonjs",
-        "moduleResolution": "node",
-        "sourceMap": false,
+        "rootDir": "./src",
         "outDir": "dist",
+        "declaration": true,
+        "emitDeclarationOnly": true,
+        "sourceMap": false,
         "forceConsistentCasingInFileNames": true,
         "strict": true,
         "skipLibCheck": true,
         "esModuleInterop": true
     },
+    "include": ["src/**/*"],
     "exclude": ["node_modules", "dist", "test", "src/**/*.spec.ts"]
 }

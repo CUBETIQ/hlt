@@ -3,7 +3,6 @@ export interface Options {
     profile?: string;
     key?: string;
     apiKey?: string;
-    access?: string;
     suffix?: string;
     clientId?: string;
     keep_connection?: boolean;

@@ -3,11 +3,11 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { initConfigFileClient, startClient } from "./api";
-import { PROFILE_DEFAULT, PROFILE_PATH, SERVER_DEFAULT_URL, TOKEN_FREE } from "./constant";
+import { PROFILE_DEFAULT, PROFILE_PATH, SERVER_DEFAULT_URL } from "./constant";
 import { listProfile } from "./manage";
 import { createProxyServer } from "./proxy";
 import { createProxyServer as createProxyTCPServer } from "./proxy_tcp";
-import { getTokenFree } from './sdk';
+import { getToken } from './sdk';
 import { generateUUID, isValidHost, isValidUrl, randomPort } from "./util";
 import { startWebhookServer } from "./webhook";
 
@@ -16,22 +16,21 @@ const packageInfo = require("../package.json");
 program
   .name("hlt")
   .description(
-    "CUBETIQ HTTP tunnel client with free access for local tunneling"
+    "CUBETIQ HTTP tunnel client for fast, scalable, and secure local tunneling"
   )
   .version(`v${packageInfo.version}`);
 
 // init
 program
   .command("init")
-  .description("generate a new client and token with free access")
+  .description("initialize client configuration and acquire JWT token")
   .option("-s, --server <string>", "setting server url", SERVER_DEFAULT_URL)
   .option(
     "-t, --token <string>",
-    "setting token (default generate FREE access token)",
+    "setting token (defaults to auto-acquiring from server)",
     ""
   )
-  .option("-a, --access <string>", "setting token access type", TOKEN_FREE)
-  .option("-c, --client <string>", "setting client (auto generate uuid)")
+  .option("-c, --client <string>", "setting client id (auto generate uuid)")
   .option(
     "-k, --key <string>",
     "setting client api key for authentication access"
@@ -67,7 +66,6 @@ program
     "-k --key <string>",
     "setting client api key for authentication access"
   )
-  .option("-a, --access <string>", "access type (FREE)", TOKEN_FREE)
   .option("-p, --profile <string>", "profile name", PROFILE_DEFAULT)
   .option("-h, --host <string>", "local host value", "localhost")
   .option("-o, --origin <string>", "change request origin")
@@ -153,7 +151,30 @@ program
     let errorCode = 0;
 
     if (type === "token" || type === "jwt") {
-      config.token = value;
+      if (value === "generate" || value === "new") {
+        console.log(`Requesting token from ${config.server}...`);
+        await getToken(config.server, {
+          clientId: config.clientId,
+          apiKey: config.apiKey,
+        })
+          .then((resp: any) => {
+            if (resp.data?.token) {
+              config.token = resp.data?.token;
+              console.log("Token acquired successfully!");
+            } else {
+              errorCode = 1;
+              console.error("Generate token failed: empty response from server", resp);
+              return;
+            }
+          })
+          .catch((err: any) => {
+            errorCode = 1;
+            console.error("Cannot get token from server:", err?.message || err);
+            return;
+          });
+      } else {
+        config.token = value;
+      }
     } else if (type === "server") {
       config.server = value;
     } else if (type === "clientId" || type === "client") {
@@ -166,26 +187,7 @@ program
     } else if (type === "apiKey" || type === "key") {
       config.apiKey = value;
     } else if (type === "access") {
-      config.access = (value && value.toUpperCase().trim()) || TOKEN_FREE;
-
-      // FREE
-      if (config.access === TOKEN_FREE) {
-        await getTokenFree(config.server)
-          .then((resp: any) => {
-            if (resp.data?.token) {
-              config.token = resp.data?.token;
-            } else {
-              errorCode = 1;
-              console.error("Generate free token failed, return with null or empty from server!", resp);
-              return;
-            }
-          })
-          .catch((err: any) => {
-            errorCode = 1;
-            console.error("cannot get free token from server", err);
-            return;
-          });
-      }
+      console.log("Notice: Access types are consolidated into unified JWT authentication.");
     }
 
     if (!config.clientId && config.apiKey) {

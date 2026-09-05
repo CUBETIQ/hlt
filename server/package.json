@@ -6,7 +6,7 @@
   "scripts": {
     "start": "bun cluster.js",
     "server": "bun server.js",
-    "test": "echo \"Hello Tests\""
+    "test": "bun test"
   },
   "repository": {
     "type": "git",
@@ -20,7 +20,6 @@
   "author": "Sambo Chea <sombochea@cubis.tech>",
   "license": "ISC",
   "dependencies": {
-    "@socket.io/admin-ui": "^0.5.1",
     "@socket.io/redis-adapter": "^8.3.0",
     "body-parser": "^1.20.3",
     "dotenv": "^16.4.7",
@@ -30,6 +29,7 @@
     "redis": "^4.7.0",
     "socket.io": "^4.8.1",
     "uuid": "^11.1.0",
-    "winston": "^3.17.0"
+    "winston": "^3.17.0",
+    "ws": "^8.18.0"
   }
 }

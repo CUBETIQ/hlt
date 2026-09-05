@@ -7,16 +7,16 @@ import { Socket, io } from "socket.io-client";
 import { TunnelRequest, TunnelResponse } from "./lib";
 import { addPrefixOnHttpSchema, generateUUID } from "./util";
 
-import { PROFILE_DEFAULT, PROFILE_PATH, SERVER_DEFAULT_URL, TOKEN_FREE } from "./constant";
+import { PROFILE_DEFAULT, PROFILE_PATH, SERVER_DEFAULT_URL } from "./constant";
 import { ClientOptions, Options } from "./interface";
-import { getTokenFree } from './sdk';
+import { getToken } from './sdk';
 
-interface Client {
+export interface Client {
     getEndpoint(): string | null;
     stop(): void;
 }
 
-class HttpTunnelClient implements Client {
+export class HttpTunnelClient implements Client {
     // create socket instance
     private socket: Socket | null = null;
     private keepAliveTimer: NodeJS.Timeout | null = null;
@@ -66,10 +66,6 @@ class HttpTunnelClient implements Client {
             config.token = options.token;
         }
 
-        if (!config.access) {
-            config.access = options.access || TOKEN_FREE;
-        }
-
         if (!config.clientId) {
             config.clientId = options.client || generateUUID();
         }
@@ -81,7 +77,7 @@ class HttpTunnelClient implements Client {
         let errorCode = 0;
         if (!config.token || options.force) {
             console.log(`Generating token from server: ${config.server}`);
-            await getTokenFree(config.server, {
+            await getToken(config.server, {
                 timestamp: (new Date().getTime()),
                 clientId: config.clientId,
                 apiKey: config.apiKey,
@@ -92,13 +88,13 @@ class HttpTunnelClient implements Client {
                         config.token = resp.data?.token;
                     } else {
                         errorCode = 1;
-                        console.error("Generate free token failed, return with null or empty from server!", resp);
+                        console.error("Generate token failed, return with null or empty from server!", resp);
                         return;
                     }
                 })
                 .catch((err: any) => {
                     errorCode = 1;
-                    console.error("cannot get free token from server", err);
+                    console.error("cannot get token from server", err);
                     return;
                 });
         }
@@ -134,7 +130,6 @@ class HttpTunnelClient implements Client {
             clientIdSub: clientIdSub,
             clientEndpoint: clientEndpoint,
             serverUrl: serverUrl,
-            access: options.access,
             keep_connection: options.keep_connection || true,
         };
 
@@ -183,7 +178,7 @@ class HttpTunnelClient implements Client {
                 `${clientLogPrefix} connect error:`,
                 (e && e.message) || "something wrong"
             );
-            if (e && e.message && e.message.startsWith("[40")) {
+            if ((options as any).exitOnError !== false && e && e.message && e.message.startsWith("[40")) {
                 process.exit(1);
             }
         });
@@ -195,7 +190,9 @@ class HttpTunnelClient implements Client {
         this.socket.on("disconnect_exit", (reason) => {
             console.warn(`${clientLogPrefix} disconnected and exited ${reason}!`);
             this.socket?.disconnect();
-            process.exit(1);
+            if ((options as any).exitOnError !== false) {
+                process.exit(1);
+            }
         });
 
         this.socket.on("request", (requestId, request) => {
@@ -403,7 +400,6 @@ class HttpTunnelClient implements Client {
 
         // options.port = port;
         options.token = config.token;
-        options.access = config.access;
         options.server = config.server;
         options.clientId = config.clientId;
         options.apiKey = options.key || config.apiKey;

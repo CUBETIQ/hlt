@@ -1,3 +1,4 @@
+require("./ws_patch");
 const cluster = require("cluster");
 const os = require("os");
 const net = require("net");

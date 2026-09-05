@@ -41,6 +41,7 @@ function safeEmitWithDrain(socket, event, ...args) {
 class TunnelSocketManager {
   constructor(socket) {
     this.socket = socket;
+    this.socket._tunnelManager = this;
     this.streams = new Map(); // id -> { requestStream, responseStream }
 
     this._onResponse = (id, data) => {

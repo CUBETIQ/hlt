@@ -27,17 +27,17 @@ export const createProxyServer = (target: string, opts?: ProxyOptions) => {
             target,
             changeOrigin: true,
             ws: true,
-            onProxyReq: (proxyReq, req, res) => {
+            onProxyReq: (proxyReq: any, req: any, res: any) => {
                 console.log(`[HTTP] Proxying ${req.method} ${req.url} to ${target}`);
             },
-            onProxyReqWs: (proxyReq, req, socket, options, head) => {
+            onProxyReqWs: (proxyReq: any, req: any, socket: any, options: any, head: any) => {
                 console.log(`[WS] Proxying ${req.method} ${req.url} to ${target}`);
             },
-            onError: (err, req, res) => {
+            onError: (err: any, req: any, res: any) => {
                 console.error(`Proxy error: ${err.message}`);
             },
             ...opts
-        })
+        } as any)
     );
 
     const proxyPort = opts?.proxyPort || port;

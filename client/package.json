@@ -1,16 +1,22 @@
 {
   "name": "@cubetiq/hlt",
   "version": "0.2.0",
-  "description": "A lightweight http tunnel client using nodejs and socket.io client",
-  "main": "dist/cli.js",
+  "description": "A lightweight, high-performance HTTP tunnel client for Node.js and Bun",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "bin": {
     "hlt": "bin/hlt"
   },
+  "files": [
+    "dist",
+    "bin",
+    "README.md"
+  ],
   "scripts": {
     "start": "bun run src/cli.ts",
-    "test": "bun test/test.ts",
+    "test": "bun test test/client.test.ts",
     "local": "bun run src/cli.ts start -p local",
-    "build": "bun build ./src/cli.ts --outdir ./dist --target node"
+    "build": "bun build ./src/cli.ts ./src/index.ts --outdir ./dist --target node --format cjs && tsc"
   },
   "repository": {
     "type": "git",
