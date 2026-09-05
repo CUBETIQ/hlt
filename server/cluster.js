@@ -188,14 +188,18 @@ if (cluster.isPrimary || cluster.isMaster) {
           claims.release(msg.names || [], msg.socketId);
           const held = workerClaims.get(worker);
           if (held) (msg.names || []).forEach((n) => held.delete(n));
-        } else if (msg.type === "RECORD_HTTP" && msg.host) {
-          clusterStats.total_http_requests++;
-          const hs = clusterStats.hostStats.get(msg.host);
-          if (hs) hs.requests = (hs.requests || 0) + 1;
-        } else if (msg.type === "RECORD_WS" && msg.host) {
-          clusterStats.total_ws_requests++;
-          const hs = clusterStats.hostStats.get(msg.host);
-          if (hs) hs.requests = (hs.requests || 0) + 1;
+        } else if (msg.type === "RECORD_STATS" && msg.hosts) {
+          // Batched counters from a worker's telemetry flush window.
+          for (const [host, delta] of Object.entries(msg.hosts)) {
+            clusterStats.total_http_requests += delta.http || 0;
+            clusterStats.total_ws_requests += delta.ws || 0;
+            let hs = clusterStats.hostStats.get(host);
+            if (!hs) {
+              hs = { requests: 0, connected_at: Date.now() };
+              clusterStats.hostStats.set(host, hs);
+            }
+            hs.requests = (hs.requests || 0) + (delta.http || 0) + (delta.ws || 0);
+          }
         } else if (msg.type === "GET_CLUSTER_STATE" && msg.reqId) {
           const socketsList = Array.from(clusterSockets.values()).map((s) => ({
             ...s,
@@ -380,6 +384,10 @@ if (cluster.isPrimary || cluster.isMaster) {
     };
 
     const primaryServer = net.createServer({ pauseOnConnect: true }, (socket) => {
+      // net.createServer does not disable Nagle the way http.Server does, and the
+      // worker inherits this socket as-is: without it every small tunnel frame can
+      // sit ~40ms waiting for a delayed ACK.
+      socket.setNoDelay(true);
       let head = null;
 
       const onData = (chunk) => {

@@ -41,6 +41,10 @@ const io = new Server(httpServer, {
   ...(realWs && realWs.Server ? { wsEngine: realWs.Server } : {}),
 });
 
+// Nagle adds up to a 40ms stall per small write, which on a tunnel is paid
+// twice (browser->server, server->client). Disable it on every inbound socket.
+httpServer.on("connection", (socket) => socket.setNoDelay(true));
+
 httpServer.on("clientError", (err, socket) => {
   if (socket && socket.writable) {
     socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
@@ -75,6 +79,20 @@ if (redisConfig && redisConfig.enabled && redisConfig.url) {
     stats.setRedisClient(pubClient);
   }).catch((err) => {
     logger.error("Failed to connect to Redis:", err.message);
+  });
+}
+
+// Cluster stats aggregation: one batched IPC message per flush window instead of
+// a `process.send` per request (each send is a serialize + pipe write on the hot
+// path). Kept even with Redis on — the primary's per-host view backs the admin
+// sockets/clients tabs, while Redis remains the authority for global counters.
+if (process.send) {
+  stats.on("flush", (batch) => {
+    const hosts = {};
+    for (const [host, delta] of batch.hosts) hosts[host] = delta;
+    try {
+      process.send({ type: "RECORD_STATS", hosts });
+    } catch {}
   });
 }
 
@@ -506,8 +524,11 @@ app.get("/_/info", (req, res) => {
 // The localhost single-tunnel fallback is deliberately excluded here: on the
 // server's own host the admin console must win over that convenience route.
 app.use((req, res, next) => {
-  if (findTunnelSocket(req, { allowLocalFallback: false })) {
-    return handleTunnelRequest(req, res);
+  // Resolve once and hand the socket down: handleTunnelRequest would otherwise
+  // repeat the whole cascade (including the O(n) socket scan) per request.
+  const tunnelSocket = findTunnelSocket(req, { allowLocalFallback: false });
+  if (tunnelSocket) {
+    return handleTunnelRequest(req, res, tunnelSocket);
   }
   next();
 });
@@ -953,9 +974,9 @@ function escapeHtml(str) {
     .replace(/'/g, "&#039;");
 }
 
-function handleTunnelRequest(req, res) {
+function handleTunnelRequest(req, res, resolvedSocket) {
   const host = req.headers.host || "";
-  const tunnelSocket = findTunnelSocket(req);
+  const tunnelSocket = resolvedSocket || findTunnelSocket(req);
 
   if (!tunnelSocket) {
     // Close the connection so a keep-alive socket pinned to this worker is
@@ -1088,9 +1109,6 @@ function handleTunnelRequest(req, res) {
 
   const onResponse = ({ statusCode, statusMessage, headers }) => {
     stats.recordHttp(hostKey);
-    if (process.send) {
-      process.send({ type: "RECORD_HTTP", host: hostKey });
-    }
     tunnelResponse.off("requestError", onRequestError);
     if (!res.headersSent) {
       res.writeHead(statusCode, statusMessage, headers);
@@ -1111,7 +1129,8 @@ function handleTunnelRequest(req, res) {
   });
 }
 
-app.use("/", handleTunnelRequest);
+// Wrapped: express would pass `next` as the third argument, which is not a socket.
+app.use("/", (req, res) => handleTunnelRequest(req, res));
 
 function createSocketHttpHeader(line, headers) {
   return (
@@ -1194,9 +1213,6 @@ httpServer.on("upgrade", (req, socket, head) => {
 
   const onResponse = ({ statusCode, statusMessage, headers, httpVersion }) => {
     stats.recordWs(hostKey);
-    if (process.send) {
-      process.send({ type: "RECORD_WS", host: hostKey });
-    }
     tunnelResponse.off("requestError", onRequestError);
 
     if (statusCode && statusCode !== 101) {

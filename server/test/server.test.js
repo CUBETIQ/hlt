@@ -71,6 +71,29 @@ describe("TelemetryManager", () => {
     expect(updatedStats.active_sockets).toBe(1);
     expect(updatedStats.total_disconnections).toBe(1);
   });
+
+  test("batches hot-path counters into a single flush event", async () => {
+    const telemetry = new TelemetryManager(10);
+    const flushes = [];
+    telemetry.on("flush", (batch) => flushes.push(batch));
+
+    await telemetry.recordConnect("a.example.com");
+    for (let i = 0; i < 50; i++) telemetry.recordHttp("a.example.com");
+    telemetry.recordWs("a.example.com");
+
+    // Nothing emitted synchronously: the hot path only touches memory.
+    expect(flushes).toHaveLength(0);
+
+    await new Promise((r) => setTimeout(r, 30));
+    expect(flushes).toHaveLength(1);
+    expect(flushes[0].http).toBe(50);
+    expect(flushes[0].ws).toBe(1);
+    expect(flushes[0].hosts.get("a.example.com")).toEqual({ http: 50, ws: 1 });
+
+    // Drained: an idle window emits nothing.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(flushes).toHaveLength(1);
+  });
 });
 
 describe("Token Security", () => {

@@ -1,6 +1,9 @@
 const { Writable, Duplex } = require("stream");
 
-const DRAIN_THRESHOLD = 64 * 1024; // 64 KB buffer threshold
+// writeBuffer holds *packets*, not bytes: the old 64K threshold could never be
+// reached, so every write completed immediately and a slow client buffered
+// without bound. 32 queued frames is roughly 2MB at our chunk sizes.
+const DRAIN_THRESHOLD = 32; // queued engine.io packets before applying backpressure
 const DRAIN_TIMEOUT = 5000; // 5s safety timeout to prevent drain hangs
 
 /**

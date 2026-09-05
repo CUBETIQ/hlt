@@ -11,6 +11,20 @@ import { PROFILE_DEFAULT, PROFILE_PATH, SERVER_DEFAULT_URL } from "./constant";
 import { ClientOptions, Options, TunnelConfig, TunnelGrant } from "./interface";
 import { getToken, getTunnelConfig } from './sdk';
 
+/**
+ * One pooled keep-alive agent for every forwarded local request. Without it each
+ * tunnelled request opens a fresh TCP connection to the local app — a handshake
+ * plus a "localhost" DNS lookup that on a dual-stack machine can cost hundreds of
+ * milliseconds on the first hit, which is exactly the "first visit is slow" feel.
+ */
+const localAgent = new http.Agent({
+    keepAlive: true,
+    keepAliveMsecs: 1000,
+    maxSockets: Infinity,
+    maxFreeSockets: 256,
+    scheduling: "lifo",
+});
+
 export interface Client {
     getEndpoint(): string | null;
     getEndpoints(): string[];
@@ -287,6 +301,13 @@ export class HttpTunnelClient implements Client {
             if (isWebSocket) {
                 request.headers.connection = request.headers.connection || "Upgrade";
                 request.headers.upgrade = "websocket";
+                // An upgraded socket is hijacked and must not return to the pool.
+                request.agent = false;
+            } else {
+                // `connection` is hop-by-hop: forwarding the browser's value (often
+                // `close`) would defeat the pool. Let the agent decide instead.
+                delete request.headers.connection;
+                request.agent = localAgent;
             }
 
             const tunnelRequest = new TunnelRequest(this.socket!, requestId);
@@ -311,6 +332,7 @@ export class HttpTunnelClient implements Client {
                 return;
             }
 
+            localReq.once("socket", (s: any) => s.setNoDelay?.(true));
             tunnelRequest.pipe(localReq);
 
             const onTunnelRequestError = (e: any) => {
