@@ -1,6 +1,7 @@
 import type { StatusResponse, TelemetryStats } from "@/lib/api"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
+import { formatBytes } from "@/lib/utils"
 import {
   ActivityIcon,
   RadioIcon,
@@ -30,18 +31,6 @@ function formatUptime(seconds: number): string {
   return parts.join(" ")
 }
 
-function formatBytes(bytes: number): string {
-  if (!bytes || isNaN(bytes)) return "0 B"
-  const units = ["B", "KB", "MB", "GB", "TB"]
-  let i = 0
-  let val = bytes
-  while (val >= 1024 && i < units.length - 1) {
-    val /= 1024
-    i++
-  }
-  return `${val.toFixed(1)} ${units[i]}`
-}
-
 export function OverviewTab({ status, stats }: OverviewTabProps) {
   const activeSockets =
     status?.activeSocketsCount ??
@@ -65,6 +54,17 @@ export function OverviewTab({ status, stats }: OverviewTabProps) {
     (status?.stats as Record<string, unknown> | undefined)?.total_connections as number ??
     0
 
+  const pick = (camel?: number, snake?: number) => camel ?? snake ?? 0
+  const statusStats = status?.stats
+  const bytesIn = pick(
+    stats?.totalBytesIn ?? statusStats?.totalBytesIn,
+    stats?.total_bytes_in ?? statusStats?.total_bytes_in
+  )
+  const bytesOut = pick(
+    stats?.totalBytesOut ?? statusStats?.totalBytesOut,
+    stats?.total_bytes_out ?? statusStats?.total_bytes_out
+  )
+
   const mem = status?.memoryUsage
   const heapUsed = mem?.heapUsed ?? 0
   const heapTotal = mem?.heapTotal ?? 1
@@ -78,7 +78,7 @@ export function OverviewTab({ status, stats }: OverviewTabProps) {
   return (
     <div className="space-y-5">
       {/* KPI Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3.5">
+      <div className="grid grid-cols-2 lg:grid-cols-3 gap-3.5">
         {/* Active Tunnels */}
         <Card className="border-border/60 bg-card">
           <CardContent className="p-4 flex items-center justify-between">
@@ -140,6 +140,46 @@ export function OverviewTab({ status, stats }: OverviewTabProps) {
             </div>
             <div className="size-10 rounded-lg bg-purple-500/10 text-purple-500 flex items-center justify-center border border-purple-500/20 shrink-0">
               <ServerIcon size={18} />
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Inbound */}
+        <Card className="border-border/60 bg-card">
+          <CardContent className="p-4 flex items-center justify-between">
+            <div className="space-y-1 min-w-0">
+              <span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider">
+                Inbound
+              </span>
+              <div className="flex items-baseline gap-2">
+                <span className="font-heading font-bold text-2xl sm:text-3xl tracking-tight text-foreground">
+                  {formatBytes(bytesIn)}
+                </span>
+                <span className="text-[11px] text-muted-foreground font-mono">from visitors</span>
+              </div>
+            </div>
+            <div className="size-10 rounded-lg bg-sky-500/10 text-sky-500 flex items-center justify-center border border-sky-500/20 shrink-0">
+              <span className="font-bold text-lg leading-none">&darr;</span>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Outbound */}
+        <Card className="border-border/60 bg-card">
+          <CardContent className="p-4 flex items-center justify-between">
+            <div className="space-y-1 min-w-0">
+              <span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider">
+                Outbound
+              </span>
+              <div className="flex items-baseline gap-2">
+                <span className="font-heading font-bold text-2xl sm:text-3xl tracking-tight text-foreground">
+                  {formatBytes(bytesOut)}
+                </span>
+                <span className="text-[11px] text-muted-foreground font-mono">to visitors</span>
+              </div>
+            </div>
+            <div className="size-10 rounded-lg bg-emerald-500/10 text-emerald-500 flex items-center justify-center border border-emerald-500/20 shrink-0">
+              <span className="font-bold text-lg leading-none">&uarr;</span>
             </div>
           </CardContent>
         </Card>
@@ -240,7 +280,7 @@ export function OverviewTab({ status, stats }: OverviewTabProps) {
             </div>
 
             <div className="p-2.5 rounded bg-muted/30 border border-border/30 flex items-center justify-between text-xs font-mono">
-              <span className="text-muted-foreground">Engine: v{status?.build?.version || "2.0.0"}</span>
+              <span className="text-muted-foreground">Engine: {status?.build?.version || "2.0.0"}</span>
               <span className="text-muted-foreground truncate max-w-[200px]">{status?.instance || "Local"}</span>
             </div>
           </CardContent>

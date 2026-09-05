@@ -10,6 +10,7 @@ import { addPrefixOnHttpSchema, generateUUID } from "./util";
 import { PROFILE_DEFAULT, PROFILE_PATH, SERVER_DEFAULT_URL } from "./constant";
 import { ClientOptions, Options, TunnelConfig, TunnelGrant } from "./interface";
 import { getToken, getTunnelConfig } from './sdk';
+import { TunnelStats, TunnelStatsSnapshot, formatBytes } from "./stats";
 
 /**
  * One pooled keep-alive agent for every forwarded local request. Without it each
@@ -28,6 +29,7 @@ const localAgent = new http.Agent({
 export interface Client {
     getEndpoint(): string | null;
     getEndpoints(): string[];
+    getStats(): TunnelStatsSnapshot;
     stop(): void;
 }
 
@@ -35,13 +37,6 @@ export interface Client {
 function buildTunnelUrl(config: TunnelConfig, name: string): string {
     const sep = config.format === "prefix" ? "-" : ".";
     return `${config.scheme}://${name}${sep}${config.domain}`;
-}
-
-function formatBytes(bytes: number): string {
-    if (!bytes || bytes <= 0) return "0 B";
-    const units = ["B", "KB", "MB", "GB"];
-    const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
-    return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
 function colorStatus(status: number): string {
@@ -61,6 +56,7 @@ export class HttpTunnelClient implements Client {
     private endpoint: string | null = null;
     private endpoints: string[] = [];
     private tunnelConfig: TunnelConfig | null = null;
+    private stats = new TunnelStats();
 
     private keepAlive() {
         if (!this.socket) {
@@ -227,6 +223,21 @@ export class HttpTunnelClient implements Client {
 
         const clientLogPrefix = `client: ${clientId} on profile: ${profile}`;
         const targetHost = options.host || "localhost";
+        const localHost = `${targetHost}:${options.port}`;
+
+        // Host header policy. Preserving the public host is the right default —
+        // frameworks build absolute redirect/cookie URLs from it — but dev servers
+        // (Next.js `/_next/*`, Vite) reject requests whose Host/Origin is not their
+        // own with a 403. `--host-header rewrite` (or an explicit value) makes the
+        // local app see a same-origin localhost request instead.
+        const hostHeaderOpt = options.hostHeader || options.origin;
+        const rewrittenHost =
+            !hostHeaderOpt || hostHeaderOpt === "preserve"
+                ? null
+                : hostHeaderOpt === "rewrite" || hostHeaderOpt === "local" || hostHeaderOpt === "true"
+                    ? localHost
+                    : hostHeaderOpt;
+        let hintedOn403 = false;
 
         this.socket.on("connect", () => {
             if (this.socket!.connected) {
@@ -242,8 +253,10 @@ export class HttpTunnelClient implements Client {
                 this.endpoint = grant.urls[0];
             }
             this.endpoints.forEach((url) => {
-                console.log(`\x1b[36m➜ Forwarding:\x1b[0m ${url} -> http://${targetHost}:${options.port}`);
+                console.log(`\x1b[36m➜ Forwarding:\x1b[0m ${url} -> http://${localHost}`);
             });
+            // Live status line last, so it stays pinned below the banner.
+            this.stats.start();
         });
 
         this.socket.on("connect_error", (e) => {
@@ -257,6 +270,7 @@ export class HttpTunnelClient implements Client {
         });
 
         this.socket.on("disconnect", (reason) => {
+            this.stats.stop();
             console.warn(`${clientLogPrefix} disconnected: ${reason}!`);
             if (reason === "io server disconnect") {
                 if (this.keepAliveTimer) {
@@ -271,6 +285,7 @@ export class HttpTunnelClient implements Client {
         });
 
         this.socket.on("disconnect_exit", (reason) => {
+            this.stats.stop();
             console.warn(`\x1b[33m${clientLogPrefix} disconnected and terminated: ${reason}!\x1b[0m`);
             if (this.keepAliveTimer) {
                 clearInterval(this.keepAliveTimer);
@@ -293,8 +308,19 @@ export class HttpTunnelClient implements Client {
             request.port = options.port;
             request.hostname = options.host || "localhost";
 
-            if (options.origin) {
-                request.headers.host = options.origin;
+            if (rewrittenHost) {
+                request.headers.host = rewrittenHost;
+                // Origin/Referer are what dev-server cross-origin checks actually
+                // read; leaving the public host there re-triggers the 403.
+                if (request.headers.origin) {
+                    request.headers.origin = `http://${rewrittenHost}`;
+                }
+                if (request.headers.referer) {
+                    request.headers.referer = String(request.headers.referer).replace(
+                        /^https?:\/\/[^/]+/,
+                        `http://${rewrittenHost}`
+                    );
+                }
             }
 
             // Ensure headers for Upgrade are formatted cleanly
@@ -323,7 +349,8 @@ export class HttpTunnelClient implements Client {
                 localReq = http.request(request);
             } catch (err: any) {
                 const duration = Date.now() - startTime;
-                console.error(
+                this.stats.recordHttp(0, 0, true);
+                this.stats.error(
                     `${colorStatus(502)} Bad Gateway \x1b[1m${isWebSocket ? "WS" : request.method}\x1b[0m ${request.path} ` +
                     `from \x1b[36m${clientIp}\x1b[0m [\x1b[31m${err?.message || String(err)}\x1b[0m] \x1b[90m(${duration}ms)\x1b[0m`
                 );
@@ -337,7 +364,7 @@ export class HttpTunnelClient implements Client {
 
             const onTunnelRequestError = (e: any) => {
                 const duration = Date.now() - startTime;
-                console.error(
+                this.stats.error(
                     `${colorStatus(502)} Tunnel Request Error \x1b[1m${isWebSocket ? "WS" : request.method}\x1b[0m ${request.path} ` +
                     `from \x1b[36m${clientIp}\x1b[0m [\x1b[31m${e?.message || String(e)}\x1b[0m] \x1b[90m(${duration}ms)\x1b[0m`
                 );
@@ -373,17 +400,30 @@ export class HttpTunnelClient implements Client {
 
                 localRes.once("end", () => {
                     const duration = Date.now() - startTime;
-                    const statusStr = colorStatus(localRes.statusCode || 200);
+                    const status = localRes.statusCode || 200;
+                    const statusStr = colorStatus(status);
                     const statusMsg = localRes.statusMessage || "";
                     const reqLen = formatBytes(reqBytes || parseInt(request.headers?.["content-length"] || "0", 10));
                     const resLen = formatBytes(resBytes || parseInt(localRes.headers?.["content-length"] || "0", 10));
 
-                    console.log(
+                    this.stats.recordHttp(reqBytes, resBytes, status >= 500);
+                    this.stats.log(
                         `${statusStr} ${statusMsg ? statusMsg + " " : ""}\x1b[1m${request.method}\x1b[0m ${request.path} ` +
                         `from \x1b[36m${clientIp}\x1b[0m ` +
                         `[\x1b[90min:\x1b[0m ${reqLen} | \x1b[90mout:\x1b[0m ${resLen}] ` +
                         `\x1b[90m(${duration}ms)\x1b[0m`
                     );
+
+                    // A dev server answering 403 to its own asset routes is almost
+                    // always the cross-origin guard (Next.js `/_next/*`, Vite).
+                    if (status === 403 && !rewrittenHost && !hintedOn403) {
+                        hintedOn403 = true;
+                        this.stats.log(
+                            `\x1b[33m! 403 from ${localHost}. Dev servers block requests whose Host/Origin is not their own ` +
+                            `(e.g. Next.js on /_next/*). Restart with \x1b[1m--host-header rewrite\x1b[0m\x1b[33m, ` +
+                            `or allow this tunnel host in the framework config (Next.js: allowedDevOrigins).\x1b[0m`
+                        );
+                    }
                 });
 
                 localRes.on("error", (err: any) => {
@@ -393,7 +433,8 @@ export class HttpTunnelClient implements Client {
 
             const onLocalError = (error: any) => {
                 const duration = Date.now() - startTime;
-                console.error(
+                this.stats.recordHttp(reqBytes, 0, true);
+                this.stats.error(
                     `${colorStatus(502)} Bad Gateway \x1b[1m${isWebSocket ? "WS" : request.method}\x1b[0m ${request.path} ` +
                     `from \x1b[36m${clientIp}\x1b[0m [\x1b[31m${error?.message || error}\x1b[0m] \x1b[90m(${duration}ms)\x1b[0m`
                 );
@@ -414,7 +455,8 @@ export class HttpTunnelClient implements Client {
                 localSocket.on("data", (chunk: any) => { wsOutBytes += chunk?.length || 0; });
                 tunnelResponse.on("data", (chunk: any) => { wsInBytes += chunk?.length || 0; });
 
-                console.log(
+                this.stats.recordWsOpen();
+                this.stats.log(
                     `\x1b[32m101\x1b[0m Switching Protocols \x1b[1mWS\x1b[0m ${request.path} ` +
                     `from \x1b[36m${clientIp}\x1b[0m \x1b[90m(upgraded)\x1b[0m`
                 );
@@ -432,7 +474,8 @@ export class HttpTunnelClient implements Client {
                 });
                 localSocket.once("close", () => {
                     const duration = Date.now() - startTime;
-                    console.log(
+                    this.stats.recordWsClose(wsInBytes, wsOutBytes);
+                    this.stats.log(
                         `\x1b[90mWS ${request.path} closed from ${clientIp} ` +
                         `[in: ${formatBytes(wsInBytes)} | out: ${formatBytes(wsOutBytes)}] (${duration}ms)\x1b[0m`
                     );
@@ -465,6 +508,17 @@ export class HttpTunnelClient implements Client {
         //     }, 2000);
         // };
         // socket.io.on("close", tryReconnect);
+
+        // Ctrl-C on the CLI: clear the live line and leave a session summary.
+        if ((options as any).exitOnError !== false) {
+            const onExitSignal = () => {
+                this.stats.stop();
+                console.log(`\n${this.stats.summary()}`);
+                process.exit(0);
+            };
+            process.once("SIGINT", onExitSignal);
+            process.once("SIGTERM", onExitSignal);
+        }
 
         this.keepAlive();
     };
@@ -571,7 +625,11 @@ export class HttpTunnelClient implements Client {
         return this;
     };
 
+    /** Live counters for this tunnel (requests, inbound/outbound bytes). */
+    public getStats = () => this.stats.snapshot();
+
     public stop = () => {
+        this.stats.stop();
         if (this.socket) {
             this.socket.disconnect();
             this.socket.close();

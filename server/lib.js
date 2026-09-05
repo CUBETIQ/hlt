@@ -176,11 +176,16 @@ class TunnelSocketManager {
   }
 }
 
+const byteLength = (chunk) =>
+  chunk ? (chunk.length || chunk.byteLength || 0) : 0;
+
 class TunnelRequest extends Writable {
   constructor({ socket, requestId, request }) {
     super({ highWaterMark: 64 * 1024 });
     this._socket = socket;
     this._requestId = requestId;
+    // Bytes relayed for this request, for per-tunnel/per-client traffic stats.
+    this.bytesSent = 0;
     this._manager = TunnelSocketManager.getOrCreate(socket);
     this._manager.registerRequest(requestId, this);
     // Prevent unhandled error event if destroyed during client disconnect
@@ -190,6 +195,7 @@ class TunnelRequest extends Writable {
   }
 
   _write(chunk, encoding, callback) {
+    this.bytesSent += byteLength(chunk);
     safeEmitWithDrain(
       this._socket,
       "request-pipe",
@@ -201,6 +207,7 @@ class TunnelRequest extends Writable {
 
   _writev(chunks, callback) {
     const data = chunks.map((c) => c.chunk);
+    data.forEach((c) => (this.bytesSent += byteLength(c)));
     safeEmitWithDrain(
       this._socket,
       "request-pipes",
@@ -239,6 +246,10 @@ class TunnelResponse extends Duplex {
     super({ highWaterMark: 64 * 1024 });
     this._socket = socket;
     this._responseId = responseId;
+    // bytesReceived: payload sent back to the visitor. bytesSent: visitor payload
+    // pushed to the tunnel client (WebSocket traffic, where this stream is duplex).
+    this.bytesReceived = 0;
+    this.bytesSent = 0;
     this._manager = TunnelSocketManager.getOrCreate(socket);
     this._manager.registerResponse(responseId, this);
     // Prevent unhandled error event if destroyed during client disconnect
@@ -256,6 +267,7 @@ class TunnelResponse extends Duplex {
 
   handleChunk(chunk) {
     if (chunk) {
+      this.bytesReceived += byteLength(chunk);
       this.push(chunk);
     }
   }
@@ -264,12 +276,16 @@ class TunnelResponse extends Duplex {
     if (!chunks || !Array.isArray(chunks)) return;
     for (const item of chunks) {
       const chunk = item?.chunk || item;
-      if (chunk) this.push(chunk);
+      if (chunk) {
+        this.bytesReceived += byteLength(chunk);
+        this.push(chunk);
+      }
     }
   }
 
   handleEnd(chunk) {
     if (chunk) {
+      this.bytesReceived += byteLength(chunk);
       this.push(chunk);
     }
     this.push(null);
@@ -286,6 +302,7 @@ class TunnelResponse extends Duplex {
   _read(size) {}
 
   _write(chunk, encoding, callback) {
+    this.bytesSent += byteLength(chunk);
     safeEmitWithDrain(
       this._socket,
       "response-pipe",
@@ -297,6 +314,7 @@ class TunnelResponse extends Duplex {
 
   _writev(chunks, callback) {
     const data = chunks.map((c) => c.chunk);
+    data.forEach((c) => (this.bytesSent += byteLength(c)));
     safeEmitWithDrain(
       this._socket,
       "response-pipes",

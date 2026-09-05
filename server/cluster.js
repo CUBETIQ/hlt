@@ -64,7 +64,31 @@ if (cluster.isPrimary || cluster.isMaster) {
       total_disconnections: 0,
       total_http_requests: 0,
       total_ws_requests: 0,
+      total_bytes_in: 0,
+      total_bytes_out: 0,
       hostStats: new Map(),
+    };
+
+    // Cumulative per-client history. Entries are never removed: a client that
+    // disconnects keeps the traffic it has already served.
+    const clientEntry = (clientId) => {
+      const cId = clientId || "anonymous";
+      let entry = clusterClients.get(cId);
+      if (!entry) {
+        entry = {
+          clientId: cId,
+          totalTunnelsCreated: 0,
+          activeHosts: new Set(),
+          http_count: 0,
+          ws_count: 0,
+          bytes_in: 0,
+          bytes_out: 0,
+          firstSeen: Date.now(),
+          lastSeen: Date.now(),
+        };
+        clusterClients.set(cId, entry);
+      }
+      return entry;
     };
 
     const forkWorker = (slot) => {
@@ -103,6 +127,7 @@ if (cluster.isPrimary || cluster.isMaster) {
             id: msg.id || `${msg.host}#${worker.process.pid}`,
             host: msg.host,
             clientId: msg.clientId || null,
+            aliases: (msg.aliases || []).filter((a) => a !== msg.host),
             connected: true,
             workerPid: worker.process.pid,
             connectedAt: Date.now(),
@@ -113,20 +138,10 @@ if (cluster.isPrimary || cluster.isMaster) {
           }
 
           const cId = msg.clientId || "anonymous";
-          let clientEntry = clusterClients.get(cId);
-          if (!clientEntry) {
-            clientEntry = {
-              clientId: cId,
-              totalTunnelsCreated: 0,
-              activeHosts: new Set(),
-              firstSeen: Date.now(),
-              lastSeen: Date.now(),
-            };
-            clusterClients.set(cId, clientEntry);
-          }
-          clientEntry.totalTunnelsCreated++;
-          clientEntry.activeHosts.add(msg.host);
-          clientEntry.lastSeen = Date.now();
+          const client = clientEntry(cId);
+          client.totalTunnelsCreated++;
+          client.activeHosts.add(msg.host);
+          client.lastSeen = Date.now();
 
           logger.info(
             `[HLT Cluster] Host '${msg.host}' (client: ${cId}) registered on worker ${worker.process.pid}`
@@ -188,17 +203,32 @@ if (cluster.isPrimary || cluster.isMaster) {
           claims.release(msg.names || [], msg.socketId);
           const held = workerClaims.get(worker);
           if (held) (msg.names || []).forEach((n) => held.delete(n));
-        } else if (msg.type === "RECORD_STATS" && msg.hosts) {
+        } else if (msg.type === "RECORD_STATS") {
           // Batched counters from a worker's telemetry flush window.
-          for (const [host, delta] of Object.entries(msg.hosts)) {
+          for (const [host, delta] of Object.entries(msg.hosts || {})) {
             clusterStats.total_http_requests += delta.http || 0;
             clusterStats.total_ws_requests += delta.ws || 0;
+            clusterStats.total_bytes_in += delta.in || 0;
+            clusterStats.total_bytes_out += delta.out || 0;
             let hs = clusterStats.hostStats.get(host);
             if (!hs) {
               hs = { requests: 0, connected_at: Date.now() };
               clusterStats.hostStats.set(host, hs);
             }
             hs.requests = (hs.requests || 0) + (delta.http || 0) + (delta.ws || 0);
+            hs.http_count = (hs.http_count || 0) + (delta.http || 0);
+            hs.ws_count = (hs.ws_count || 0) + (delta.ws || 0);
+            hs.bytes_in = (hs.bytes_in || 0) + (delta.in || 0);
+            hs.bytes_out = (hs.bytes_out || 0) + (delta.out || 0);
+          }
+          // Client totals are history: they outlive the tunnel that produced them.
+          for (const [clientId, delta] of Object.entries(msg.clients || {})) {
+            const c = clientEntry(clientId);
+            c.http_count += delta.http || 0;
+            c.ws_count += delta.ws || 0;
+            c.bytes_in += delta.in || 0;
+            c.bytes_out += delta.out || 0;
+            c.lastSeen = Date.now();
           }
         } else if (msg.type === "GET_CLUSTER_STATE" && msg.reqId) {
           const socketsList = Array.from(clusterSockets.values()).map((s) => ({
@@ -208,17 +238,16 @@ if (cluster.isPrimary || cluster.isMaster) {
 
           const clientsList = Array.from(clusterClients.values()).map((c) => {
             const activeHosts = Array.from(c.activeHosts);
-            let clientRequests = 0;
-            activeHosts.forEach((h) => {
-              const hs = clusterStats.hostStats.get(h);
-              if (hs && hs.requests) clientRequests += hs.requests;
-            });
             return {
               clientId: c.clientId,
               activeTunnelsCount: activeHosts.length,
               totalTunnelsCreated: c.totalTunnelsCreated,
               activeHosts,
-              totalRequests: clientRequests,
+              totalRequests: c.http_count + c.ws_count,
+              httpRequests: c.http_count,
+              wsRequests: c.ws_count,
+              bytesIn: c.bytes_in,
+              bytesOut: c.bytes_out,
               firstSeen: c.firstSeen,
               lastSeen: c.lastSeen,
               status: activeHosts.length > 0 ? "online" : "offline",
@@ -246,12 +275,16 @@ if (cluster.isPrimary || cluster.isMaster) {
               total_disconnections: totalDisc,
               total_http_requests: totalHttp,
               total_ws_requests: totalWs,
+              total_bytes_in: clusterStats.total_bytes_in,
+              total_bytes_out: clusterStats.total_bytes_out,
               active_sockets: activeSocks,
               totalConnections: totalConn,
               totalDisconnections: totalDisc,
               totalHttpRequests: totalHttp,
               totalWsRequests: totalWs,
               totalRequests: totalHttp + totalWs,
+              totalBytesIn: clusterStats.total_bytes_in,
+              totalBytesOut: clusterStats.total_bytes_out,
               activeSockets: activeSocks,
               hostStats: hostStatsObj,
               storage: "cluster-ipc",

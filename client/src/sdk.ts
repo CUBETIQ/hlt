@@ -2,6 +2,7 @@ import axios, { AxiosResponse } from "axios";
 import { HttpTunnelClient } from "./api";
 import { SERVER_DEFAULT_URL } from "./constant";
 import { Options, TunnelConfig } from "./interface";
+import { TunnelStatsSnapshot } from "./stats";
 import { generateUUID } from "./util";
 
 export interface TokenPayload {
@@ -75,6 +76,8 @@ export interface ConnectOptions {
   address?: string;
   suffix?: string;
   origin?: string;
+  /** "preserve" (default), "rewrite", or an explicit Host header value. */
+  hostHeader?: string;
   keep_connection?: boolean;
   /** Public tunnel names to reserve. Defaults to the client id. */
   names?: string[];
@@ -83,6 +86,8 @@ export interface ConnectOptions {
 export interface TunnelInstance {
   endpoint: string | null;
   endpoints: string[];
+  /** Live traffic counters for this tunnel. */
+  stats: TunnelStatsSnapshot;
   stop(): void;
   client: HttpTunnelClient;
 }
@@ -142,6 +147,7 @@ export class HltClient {
       host: options.host || "localhost",
       suffix: options.suffix,
       origin: options.origin,
+      hostHeader: options.hostHeader,
       names: options.names,
       keep_connection: options.keep_connection ?? true,
       exitOnError: false,
@@ -158,6 +164,9 @@ export class HltClient {
       },
       get endpoints() {
         return tunnelClient.getEndpoints();
+      },
+      get stats() {
+        return tunnelClient.getStats();
       },
       stop: () => {
         tunnelClient.stop();

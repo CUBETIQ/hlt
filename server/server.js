@@ -90,8 +90,10 @@ if (process.send) {
   stats.on("flush", (batch) => {
     const hosts = {};
     for (const [host, delta] of batch.hosts) hosts[host] = delta;
+    const clients = {};
+    for (const [clientId, delta] of batch.clients) clients[clientId] = delta;
     try {
-      process.send({ type: "RECORD_STATS", hosts });
+      process.send({ type: "RECORD_STATS", hosts, clients });
     } catch {}
   });
 }
@@ -303,6 +305,10 @@ function resolveRequestedNames(socket, clientId) {
 // Client tracking registry
 const clientRegistry = new Map();
 
+/** How a socket's owner is shown in the console and counted in telemetry. */
+const labelOf = (socket) =>
+  (socket && (socket.clientLabel || socket.clientId)) || "anonymous";
+
 function registerClientTunnel(clientId, host) {
   const cId = clientId || "anonymous";
   let client = clientRegistry.get(cId);
@@ -349,7 +355,16 @@ io.use((socket, next) => {
       return next(new Error("[401-VERIFY_TOKEN] Authentication error: Invalid verification claim"));
     }
 
-    socket.clientId = decoded.clientId;
+    // Verified identity — the only one allowed to make ownership decisions
+    // (host takeover, name claims).
+    socket.clientId = decoded.clientId || null;
+    // Display/telemetry label. Tokens minted before clientId was a claim have
+    // none, which is what surfaces as "anonymous" in the console; fall back to
+    // what the client announced. Deliberately NOT used for ownership: the
+    // handshake value is client-supplied and therefore spoofable.
+    const handshakeAuth = socket.handshake.auth || {};
+    socket.clientLabel =
+      socket.clientId || handshakeAuth.clientId || handshakeAuth.apiKey || null;
     socket.connectHost = connectHost;
 
     const existsSocket = tunnelSockets[connectHost];
@@ -369,8 +384,8 @@ io.use((socket, next) => {
         );
         delete tunnelSockets[connectHost];
         activePrimaryHosts.delete(connectHost);
-        stats.deleteStats(connectHost);
-        unregisterClientTunnel(existsSocket.clientId, connectHost);
+        stats.recordDisconnect(connectHost, labelOf(existsSocket));
+        unregisterClientTunnel(labelOf(existsSocket), connectHost);
         existsSocket.disconnect(true);
         existsSocket.removeAllListeners();
         return next();
@@ -427,8 +442,9 @@ io.on("connection", (socket) => {
     aliasToPrimaryHost.set(alias, connectHost);
   });
 
-  registerClientTunnel(socket.clientId, connectHost);
-  logger.info(`client connected at: ${connectHost} (id: ${socket.id}, client: ${socket.clientId || "anonymous"}, aliases: [${aliases.join(", ")}])`);
+  const clientLabel = labelOf(socket);
+  registerClientTunnel(clientLabel, connectHost);
+  logger.info(`client connected at: ${connectHost} (id: ${socket.id}, client: ${clientLabel}, aliases: [${aliases.join(", ")}])`);
 
   // Notify cluster primary if in multi-worker mode
   if (process.send) {
@@ -437,7 +453,7 @@ io.on("connection", (socket) => {
       host: connectHost,
       aliases: aliases,
       id: socket.id,
-      clientId: socket.clientId || null,
+      clientId: clientLabel,
     });
   }
 
@@ -453,7 +469,7 @@ io.on("connection", (socket) => {
   });
 
   // Record privacy-first connection telemetry
-  stats.recordConnect(connectHost);
+  stats.recordConnect(connectHost, clientLabel);
 
   const onMessage = (message) => {
     if (message === "ping") {
@@ -469,8 +485,8 @@ io.on("connection", (socket) => {
     if (tunnelSockets[connectHost] === socket) {
       delete tunnelSockets[connectHost];
       activePrimaryHosts.delete(connectHost);
-      stats.deleteStats(connectHost);
-      unregisterClientTunnel(socket.clientId, connectHost);
+      stats.recordDisconnect(connectHost, clientLabel);
+      unregisterClientTunnel(clientLabel, connectHost);
     }
 
     aliases.forEach((alias) => {
@@ -683,8 +699,8 @@ if (process.on) {
           s.emit("disconnect_exit", "Disconnected by administrator");
         } catch {}
         delete tunnelSockets[msg.host];
-        stats.deleteStats(msg.host);
-        unregisterClientTunnel(s.clientId, msg.host);
+        stats.recordDisconnect(msg.host, labelOf(s));
+        unregisterClientTunnel(labelOf(s), msg.host);
         s.disconnect(true);
       }
     }
@@ -722,16 +738,26 @@ function clusterRequest(msg, fallback, timeout = 2000) {
 }
 
 function getClusterState(timeout = 1000) {
-  const localSockets = Object.keys(tunnelSockets || {}).map((host) => {
-    const socket = tunnelSockets[host];
-    return {
-      id: socket.id,
-      host: host,
-      clientId: socket.clientId || null,
-      connected: socket.connected,
-      stats: stats.getHostStats(host),
-    };
-  });
+  // tunnelSockets holds one entry per alias; collapse them so a tunnel is one
+  // row (counters live on the primary host key) instead of one row per alias.
+  const bySocketId = new Map();
+  for (const [host, socket] of Object.entries(tunnelSockets || {})) {
+    const primary = socket.connectHost || host;
+    let row = bySocketId.get(socket.id);
+    if (!row) {
+      row = {
+        id: socket.id,
+        host: primary,
+        clientId: labelOf(socket),
+        connected: socket.connected,
+        aliases: [],
+        stats: stats.getHostStats(primary),
+      };
+      bySocketId.set(socket.id, row);
+    }
+    if (host !== primary && !row.aliases.includes(host)) row.aliases.push(host);
+  }
+  const localSockets = Array.from(bySocketId.values());
 
   const fallback = { sockets: localSockets, clients: null, stats: null };
   return clusterRequest({ type: "GET_CLUSTER_STATE" }, fallback, timeout);
@@ -757,11 +783,20 @@ adminRouter.get("/status", adminAuthMiddleware, async (req, res) => {
 });
 
 adminRouter.get("/sockets", adminAuthMiddleware, async (req, res) => {
-  const clusterData = await getClusterState();
-  res.status(200).json({
-    total: clusterData.sockets.length,
-    sockets: clusterData.sockets,
-  });
+  const [clusterData, globalStats] = await Promise.all([
+    getClusterState(),
+    stats.getGlobalStats(),
+  ]);
+  // With Redis on, its per-host hashes are the cluster-wide truth; otherwise the
+  // primary's aggregate (or this process') already is.
+  const redisHostStats =
+    redisConfig && redisConfig.enabled ? globalStats.hostStats || {} : null;
+  const sockets = clusterData.sockets.map((s) => ({
+    ...s,
+    stats: (redisHostStats && redisHostStats[s.host]) || s.stats,
+  }));
+
+  res.status(200).json({ total: sockets.length, sockets });
 });
 
 adminRouter.delete("/sockets/:host", adminAuthMiddleware, (req, res) => {
@@ -772,8 +807,8 @@ adminRouter.delete("/sockets/:host", adminAuthMiddleware, (req, res) => {
       s.emit("disconnect_exit", "Disconnected by administrator");
     } catch {}
     delete tunnelSockets[host];
-    stats.deleteStats(host);
-    unregisterClientTunnel(s.clientId, host);
+    stats.recordDisconnect(host, labelOf(s));
+    unregisterClientTunnel(labelOf(s), host);
     s.disconnect(true);
   }
   if (process.send) {
@@ -786,54 +821,69 @@ adminRouter.delete("/sockets/:host", adminAuthMiddleware, (req, res) => {
   });
 });
 
+/**
+ * Clients are two things joined: the *live* view (which tunnels a client holds
+ * right now) and its *durable* traffic history, which must outlive the tunnel —
+ * disconnecting used to zero a client's numbers. History comes from Redis when
+ * enabled (shared by every worker and surviving restarts), otherwise from the
+ * cluster primary, otherwise from this process.
+ */
 adminRouter.get("/clients", adminAuthMiddleware, async (req, res) => {
-  const clusterData = await getClusterState();
-  if (clusterData.clients && clusterData.clients.length) {
-    return res.status(200).json({
-      total: clusterData.clients.length,
-      clients: clusterData.clients,
-    });
-  }
+  const [clusterData, localClients] = await Promise.all([
+    getClusterState(),
+    stats.getClients(),
+  ]);
+  const redisOn = !!(redisConfig && redisConfig.enabled);
 
-  // Fallback / Single-process: aggregate from clientRegistry
-  const clientsList = [];
-  for (const [cId, cData] of clientRegistry.entries()) {
-    const activeHosts = Array.from(cData.activeHosts || []);
-    let totalRequests = 0;
-    activeHosts.forEach((h) => {
-      const hs = stats.getHostStats(h);
-      if (hs && hs.requests) totalRequests += hs.requests;
-    });
-    clientsList.push({
-      clientId: cId,
-      activeTunnelsCount: activeHosts.length,
-      totalTunnelsCreated: cData.totalTunnelsCreated || activeHosts.length,
-      activeHosts,
-      totalRequests,
-      firstSeen: cData.firstSeen,
-      lastSeen: cData.lastSeen,
-      status: activeHosts.length > 0 ? "online" : "offline",
-    });
-  }
-
-  // Ensure active tunnel sockets without an entry are also surfaced
-  Object.keys(tunnelSockets || {}).forEach((h) => {
-    const s = tunnelSockets[h];
-    const cId = s.clientId || "anonymous";
-    if (!clientRegistry.has(cId)) {
-      const hs = stats.getHostStats(h);
-      clientsList.push({
+  const live = new Map();
+  if (clusterData.clients) {
+    clusterData.clients.forEach((c) => live.set(c.clientId, c));
+  } else {
+    for (const [cId, cData] of clientRegistry.entries()) {
+      live.set(cId, {
         clientId: cId,
-        activeTunnelsCount: 1,
-        totalTunnelsCreated: 1,
-        activeHosts: [h],
-        totalRequests: hs?.requests || 0,
-        firstSeen: Date.now(),
-        lastSeen: Date.now(),
-        status: "online",
+        activeHosts: Array.from(cData.activeHosts || []),
+        totalTunnelsCreated: cData.totalTunnelsCreated,
+        firstSeen: cData.firstSeen,
+        lastSeen: cData.lastSeen,
       });
     }
+  }
+  // Surface active sockets that have no registry entry yet.
+  Object.keys(tunnelSockets || {}).forEach((h) => {
+    const cId = labelOf(tunnelSockets[h]);
+    if (!live.has(cId)) {
+      live.set(cId, { clientId: cId, activeHosts: [h], lastSeen: Date.now() });
+    }
   });
+
+  const counters = new Map(localClients.map((c) => [c.clientId, c]));
+  if (!redisOn && clusterData.clients) {
+    // Without Redis the primary is the only place worker counters are summed.
+    clusterData.clients.forEach((c) => counters.set(c.clientId, c));
+  }
+
+  const clientsList = Array.from(new Set([...live.keys(), ...counters.keys()]))
+    .map((clientId) => {
+      const l = live.get(clientId) || {};
+      const c = counters.get(clientId) || {};
+      const activeHosts = l.activeHosts || [];
+      return {
+        clientId,
+        status: activeHosts.length > 0 ? "online" : "offline",
+        activeTunnelsCount: activeHosts.length,
+        activeHosts,
+        totalTunnelsCreated: c.totalTunnelsCreated || l.totalTunnelsCreated || 0,
+        totalRequests: c.totalRequests || 0,
+        httpRequests: c.httpRequests || 0,
+        wsRequests: c.wsRequests || 0,
+        bytesIn: c.bytesIn || 0,
+        bytesOut: c.bytesOut || 0,
+        firstSeen: c.firstSeen || l.firstSeen || null,
+        lastSeen: Math.max(c.lastSeen || 0, l.lastSeen || 0) || null,
+      };
+    })
+    .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
 
   res.status(200).json({
     total: clientsList.length,
@@ -847,14 +897,14 @@ adminRouter.delete("/clients/:clientId", adminAuthMiddleware, (req, res) => {
 
   Object.keys(tunnelSockets || {}).forEach((host) => {
     const s = tunnelSockets[host];
-    const cId = s.clientId || "anonymous";
+    const cId = labelOf(s);
     if (cId === clientId) {
       try {
         s.emit("disconnect_exit", "Client disconnected by administrator");
       } catch {}
       delete tunnelSockets[host];
-      stats.deleteStats(host);
-      unregisterClientTunnel(s.clientId, host);
+      stats.recordDisconnect(host, cId);
+      unregisterClientTunnel(cId, host);
       s.disconnect(true);
       disconnectedCount++;
       if (process.send) {
@@ -1074,6 +1124,7 @@ function handleTunnelRequest(req, res, resolvedSocket) {
   }
 
   const hostKey = tunnelSocket.connectHost || host;
+  const clientKey = labelOf(tunnelSocket);
   const requestId = uuidV4();
   const tunnelRequest = new TunnelRequest({
     socket: tunnelSocket,
@@ -1108,7 +1159,7 @@ function handleTunnelRequest(req, res, resolvedSocket) {
   };
 
   const onResponse = ({ statusCode, statusMessage, headers }) => {
-    stats.recordHttp(hostKey);
+    stats.recordHttp(hostKey, clientKey);
     tunnelResponse.off("requestError", onRequestError);
     if (!res.headersSent) {
       res.writeHead(statusCode, statusMessage, headers);
@@ -1123,6 +1174,14 @@ function handleTunnelRequest(req, res, resolvedSocket) {
   tunnelResponse.pipe(res);
 
   res.once("close", () => {
+    // Bytes are only final once the exchange is over, so account for them here
+    // (fires on both completion and abort).
+    stats.recordTraffic(
+      hostKey,
+      clientKey,
+      tunnelRequest.bytesSent,
+      tunnelResponse.bytesReceived
+    );
     if (!res.writableEnded) {
       cleanup(new Error("Response closed prematurely"));
     }
@@ -1178,6 +1237,7 @@ httpServer.on("upgrade", (req, socket, head) => {
   }
 
   const hostKey = tunnelSocket.connectHost || host;
+  const clientKey = labelOf(tunnelSocket);
   const requestId = uuidV4();
   const tunnelRequest = new TunnelRequest({
     socket: tunnelSocket,
@@ -1200,7 +1260,19 @@ httpServer.on("upgrade", (req, socket, head) => {
     responseId: requestId,
   });
 
+  let trafficRecorded = false;
   const cleanup = (err) => {
+    if (!trafficRecorded) {
+      trafficRecorded = true;
+      // A WS session's totals are only known when it ends; cleanup can be
+      // reached from either side, so record exactly once.
+      stats.recordTraffic(
+        hostKey,
+        clientKey,
+        tunnelResponse.bytesSent,
+        tunnelResponse.bytesReceived
+      );
+    }
     tunnelRequest.destroy(err);
     tunnelResponse.destroy(err);
     socket.destroy(err);
@@ -1212,7 +1284,7 @@ httpServer.on("upgrade", (req, socket, head) => {
   };
 
   const onResponse = ({ statusCode, statusMessage, headers, httpVersion }) => {
-    stats.recordWs(hostKey);
+    stats.recordWs(hostKey, clientKey);
     tunnelResponse.off("requestError", onRequestError);
 
     if (statusCode && statusCode !== 101) {

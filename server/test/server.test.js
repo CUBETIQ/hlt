@@ -88,11 +88,38 @@ describe("TelemetryManager", () => {
     expect(flushes).toHaveLength(1);
     expect(flushes[0].http).toBe(50);
     expect(flushes[0].ws).toBe(1);
-    expect(flushes[0].hosts.get("a.example.com")).toEqual({ http: 50, ws: 1 });
+    expect(flushes[0].hosts.get("a.example.com")).toEqual({
+      http: 50,
+      ws: 1,
+      in: 0,
+      out: 0,
+    });
 
     // Drained: an idle window emits nothing.
     await new Promise((r) => setTimeout(r, 30));
     expect(flushes).toHaveLength(1);
+  });
+
+  test("keeps per-client traffic history after the tunnel disconnects", async () => {
+    const telemetry = new TelemetryManager(10);
+
+    await telemetry.recordConnect("a.example.com", "acme");
+    telemetry.recordHttp("a.example.com", "acme");
+    telemetry.recordTraffic("a.example.com", "acme", 100, 2500);
+    await telemetry.recordDisconnect("a.example.com", "acme");
+
+    // Host row is gone (the tunnel is), the client's history is not.
+    expect(telemetry.getHostStats("a.example.com").requests).toBe(0);
+
+    const clients = await telemetry.getClients();
+    expect(clients).toHaveLength(1);
+    expect(clients[0]).toMatchObject({
+      clientId: "acme",
+      totalRequests: 1,
+      bytesIn: 100,
+      bytesOut: 2500,
+      totalTunnelsCreated: 1,
+    });
   });
 });
 

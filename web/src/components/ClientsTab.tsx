@@ -2,6 +2,7 @@ import { useState, useMemo } from "react"
 import type { ColumnDef } from "@tanstack/react-table"
 import type { ClientItem } from "@/lib/api"
 import { useDisconnectClient } from "@/lib/queries"
+import { formatBytes } from "@/lib/utils"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -147,9 +148,32 @@ export function ClientsTab({ clients, loading, onRefresh }: ClientsTabProps) {
       {
         accessorKey: "totalRequests",
         header: () => <div className="text-right">Total Requests</div>,
+        cell: ({ row }) => {
+          const { totalRequests, httpRequests, wsRequests } = row.original
+          return (
+            <div className="text-right">
+              <div className="font-mono text-xs font-medium">
+                {(totalRequests || 0).toLocaleString()}
+              </div>
+              <div className="font-mono text-[10px] text-muted-foreground">
+                {(httpRequests || 0).toLocaleString()} http &bull;{" "}
+                {(wsRequests || 0).toLocaleString()} ws
+              </div>
+            </div>
+          )
+        },
+      },
+      {
+        id: "traffic",
+        header: () => <div className="text-right">Traffic</div>,
         cell: ({ row }) => (
-          <div className="text-right font-mono text-xs font-medium">
-            {(row.original.totalRequests || 0).toLocaleString()}
+          <div className="text-right font-mono text-[11px]">
+            <div className="text-sky-600 dark:text-sky-400" title="Inbound (received from visitors)">
+              &darr; {formatBytes(row.original.bytesIn)}
+            </div>
+            <div className="text-emerald-600 dark:text-emerald-400" title="Outbound (served to visitors)">
+              &uarr; {formatBytes(row.original.bytesOut)}
+            </div>
           </div>
         ),
       },

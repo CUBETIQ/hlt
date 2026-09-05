@@ -70,6 +70,11 @@ program
   .option("-h, --host <string>", "local host value", "localhost")
   .option("-o, --origin <string>", "change request origin")
   .option(
+    "-H, --host-header <value>",
+    "host header sent to the local app: preserve (default), rewrite (use the local host:port — needed by Next.js/Vite dev servers that 403 cross-origin /_next/* requests), or an explicit host",
+    "preserve"
+  )
+  .option(
     "-n, --name <names>",
     "comma separated public tunnel names to reserve (default: client id)"
   )

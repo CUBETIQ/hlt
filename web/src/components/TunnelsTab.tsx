@@ -2,6 +2,7 @@ import { useState, useMemo } from "react"
 import type { ColumnDef } from "@tanstack/react-table"
 import type { SocketItem } from "@/lib/api"
 import { useDisconnectSocket } from "@/lib/queries"
+import { formatBytes } from "@/lib/utils"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -48,18 +49,30 @@ export function TunnelsTab({ sockets, loading, onRefresh }: TunnelsTabProps) {
         header: "Host",
         cell: ({ row }) => {
           const host = row.original.host
+          const aliases = row.original.aliases || []
           return (
-            <div className="flex items-center gap-1.5 font-mono text-xs">
-              <span className="font-semibold">{host}</span>
-              <a
-                href={`http://${host}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-muted-foreground hover:text-primary transition-colors inline-flex items-center"
-                title={`Open http://${host}`}
-              >
-                <ExternalLinkIcon size={12} />
-              </a>
+            <div className="space-y-0.5">
+              <div className="flex items-center gap-1.5 font-mono text-xs">
+                <span className="font-semibold">{host}</span>
+                <a
+                  href={`http://${host}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-muted-foreground hover:text-primary transition-colors inline-flex items-center"
+                  title={`Open http://${host}`}
+                >
+                  <ExternalLinkIcon size={12} />
+                </a>
+              </div>
+              {aliases.length > 0 && (
+                <div
+                  className="font-mono text-[10px] text-muted-foreground truncate max-w-[260px]"
+                  title={aliases.join("\n")}
+                >
+                  also: {aliases.slice(0, 2).join(", ")}
+                  {aliases.length > 2 ? ` +${aliases.length - 2}` : ""}
+                </div>
+              )}
             </div>
           )
         },
@@ -97,14 +110,33 @@ export function TunnelsTab({ sockets, loading, onRefresh }: TunnelsTabProps) {
         id: "requests",
         header: () => <div className="text-right">Requests</div>,
         cell: ({ row }) => {
-          const stats = row.original.stats as Record<string, unknown> | undefined
-          const count = (stats?.requests as number) || (stats?.http_count as number) || 0
+          const stats = row.original.stats
+          const http = stats?.http_count || 0
+          const ws = stats?.ws_count || 0
+          const count = stats?.requests ?? http + ws
           return (
-            <div className="text-right font-mono text-xs font-medium">
-              {count.toLocaleString()}
+            <div className="text-right">
+              <div className="font-mono text-xs font-medium">{count.toLocaleString()}</div>
+              <div className="font-mono text-[10px] text-muted-foreground">
+                {http.toLocaleString()} http &bull; {ws.toLocaleString()} ws
+              </div>
             </div>
           )
         },
+      },
+      {
+        id: "traffic",
+        header: () => <div className="text-right">Traffic</div>,
+        cell: ({ row }) => (
+          <div className="text-right font-mono text-[11px]">
+            <div className="text-sky-600 dark:text-sky-400" title="Inbound (received from visitors)">
+              &darr; {formatBytes(row.original.stats?.bytes_in)}
+            </div>
+            <div className="text-emerald-600 dark:text-emerald-400" title="Outbound (served to visitors)">
+              &uarr; {formatBytes(row.original.stats?.bytes_out)}
+            </div>
+          </div>
+        ),
       },
       {
         id: "actions",

@@ -4,6 +4,7 @@ import type { TelemetryStats } from "@/lib/api"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { DataTable } from "@/components/ui/data-table"
+import { formatBytes } from "@/lib/utils"
 import {
   ShieldIcon,
   ActivityIcon,
@@ -18,10 +19,15 @@ interface TelemetryTabProps {
 interface HostStatRow {
   host: string
   requests: number
+  http: number
+  ws: number
+  bytesIn: number
+  bytesOut: number
 }
 
 export function TelemetryTab({ stats }: TelemetryTabProps) {
-  const hostStats = (stats?.hostStats || {}) as Record<string, Record<string, unknown>>
+  const rawHostStats = stats?.hostStats
+  const storage = (stats?.storage as string) || "memory"
   const totalRequests =
     stats?.totalRequests ??
     (stats as Record<string, unknown> | undefined)?.total_http_requests as number ??
@@ -32,11 +38,19 @@ export function TelemetryTab({ stats }: TelemetryTabProps) {
     0
 
   const tableData = useMemo<HostStatRow[]>(() => {
-    return Object.entries(hostStats).map(([host, data]) => ({
-      host,
-      requests: (data?.requests as number) || (data?.http_count as number) || 0,
-    }))
-  }, [hostStats])
+    return Object.entries(rawHostStats || {}).map(([host, data]) => {
+      const http = data?.http_count || 0
+      const ws = data?.ws_count || 0
+      return {
+        host,
+        requests: data?.requests ?? http + ws,
+        http,
+        ws,
+        bytesIn: data?.bytes_in || 0,
+        bytesOut: data?.bytes_out || 0,
+      }
+    })
+  }, [rawHostStats])
 
   const columns = useMemo<ColumnDef<HostStatRow>[]>(
     () => [
@@ -51,19 +65,32 @@ export function TelemetryTab({ stats }: TelemetryTabProps) {
         accessorKey: "requests",
         header: () => <div className="text-right">Requests</div>,
         cell: ({ row }) => (
-          <div className="text-right font-mono text-xs font-medium">
-            {row.original.requests.toLocaleString()}
+          <div className="text-right">
+            <div className="font-mono text-xs font-medium">
+              {row.original.requests.toLocaleString()}
+            </div>
+            <div className="font-mono text-[10px] text-muted-foreground">
+              {row.original.http.toLocaleString()} http &bull;{" "}
+              {row.original.ws.toLocaleString()} ws
+            </div>
           </div>
         ),
       },
       {
-        id: "status",
-        header: () => <div className="text-right">Tracking</div>,
-        cell: () => (
-          <div className="text-right">
-            <Badge variant="outline" className="text-[10px] py-0 px-1 font-mono">
-              active
-            </Badge>
+        id: "inbound",
+        header: () => <div className="text-right">Inbound</div>,
+        cell: ({ row }) => (
+          <div className="text-right font-mono text-xs text-sky-600 dark:text-sky-400">
+            &darr; {formatBytes(row.original.bytesIn)}
+          </div>
+        ),
+      },
+      {
+        id: "outbound",
+        header: () => <div className="text-right">Outbound</div>,
+        cell: ({ row }) => (
+          <div className="text-right font-mono text-xs text-emerald-600 dark:text-emerald-400">
+            &uarr; {formatBytes(row.original.bytesOut)}
           </div>
         ),
       },
@@ -133,9 +160,22 @@ export function TelemetryTab({ stats }: TelemetryTabProps) {
             <DatabaseIcon size={16} className="text-primary" />
             Host Traffic
           </CardTitle>
-          <Badge variant="outline" className="font-mono text-[10px] py-0">
-            {tableData.length} records
-          </Badge>
+          <div className="flex items-center gap-1.5">
+            <Badge
+              variant={storage === "redis" ? "success" : "outline"}
+              className="font-mono text-[10px] py-0"
+              title={
+                storage === "redis"
+                  ? "Counters are shared across all workers via Redis"
+                  : "Counters live in this process/cluster only"
+              }
+            >
+              {storage}
+            </Badge>
+            <Badge variant="outline" className="font-mono text-[10px] py-0">
+              {tableData.length} records
+            </Badge>
+          </div>
         </CardHeader>
 
         <CardContent className="pt-1">

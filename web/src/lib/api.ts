@@ -25,11 +25,15 @@ export interface SocketItem {
   id: string
   host: string
   clientId: string | null
+  aliases?: string[]
   connected: boolean
   stats?: {
     requests?: number
     http_count?: number
     ws_count?: number
+    bytes_in?: number
+    bytes_out?: number
+    connected_at?: number
     last_active?: number
   }
 }
@@ -45,6 +49,10 @@ export interface ClientItem {
   totalTunnelsCreated: number
   activeHosts: string[]
   totalRequests: number
+  httpRequests?: number
+  wsRequests?: number
+  bytesIn?: number
+  bytesOut?: number
   firstSeen: number
   lastSeen: number
   status: "online" | "offline"
@@ -60,11 +68,15 @@ export interface TelemetryStats {
   totalConnections?: number
   totalHttpRequests?: number
   totalWsRequests?: number
+  totalBytesIn?: number
+  totalBytesOut?: number
   activeSockets?: number
   total_requests?: number
   total_connections?: number
   total_http_requests?: number
   total_ws_requests?: number
+  total_bytes_in?: number
+  total_bytes_out?: number
   active_sockets?: number
   service?: {
     name?: string
@@ -72,7 +84,17 @@ export interface TelemetryStats {
     startedAt?: number
     uptime?: number
   }
-  hostStats?: Record<string, { requests?: number; http_count?: number; ws_count?: number; last_active?: number }>
+  hostStats?: Record<
+    string,
+    {
+      requests?: number
+      http_count?: number
+      ws_count?: number
+      bytes_in?: number
+      bytes_out?: number
+      last_active?: number
+    }
+  >
   [key: string]: unknown
 }
 

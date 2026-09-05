@@ -8,6 +8,13 @@ export interface Options {
     keep_connection?: boolean;
     token?: string;
     origin?: string;
+    /**
+     * Host header sent to the local app: "preserve" (default, keeps the public
+     * tunnel host), "rewrite" (uses <host>:<port>, which is what dev servers
+     * such as Next.js require for their /_next/* cross-origin guard), or an
+     * explicit host value.
+     */
+    hostHeader?: string;
     port?: number;
     host?: string;
     autoinit?: boolean; // auto init the profile (if profile not found)
