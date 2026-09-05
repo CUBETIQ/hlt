@@ -1,79 +1,133 @@
-# CUBETIQ HTTP Tunnel Client
+# @cubetiq/hlt
 
-A lightweight http tunnel client using nodejs and socket.io client.
+Lightweight HTTP/WebSocket tunnel client for Node.js and Bun. Expose a local port to the internet through the HLT server.
 
-### Installation
+## Install
 
 ```shell
 npm i -g @cubetiq/hlt
-
-OR
-
-npx -y @cubetiq/hlt
-
 ```
 
-### Usages
-
--   If installed to global (bin), please using cli
+Or run without installing:
 
 ```shell
-hlt [command] [options]
+npx -y @cubetiq/hlt <command>
 ```
 
--   Initialize Client and Start (Quick)
+## Quick start
 
 ```shell
-# Initialize a client and token for connect (default's profile)
-npx -y @cubetiq/hlt init
+# One-time setup: creates a client id and acquires a token
+hlt init
 
-# Start port 3000 to remote server
-npx -y @cubetiq/hlt start 3000
+# Expose local port 3000
+hlt start 3000
 ```
 
-# Start port 3000 with suffix to remote server
+Your public URL prints on connect.
 
-npx -y @cubetiq/hlt start 3000 -s mytest
+## Common use cases
 
-````
-
-- Initialize Client and Start (Quick with custom's profile)
+**Expose a dev server**
 
 ```shell
-# Initialize a client and token for connect (mytest's profile)
-npx -y @cubetiq/hlt init -p mytest
-
-# Start port 3000 to remote server (mytest's profile)
-npx -y @cubetiq/hlt start 3000 -p mytest
-````
-
-### Custom Config
-
--   Generate Client Key
-
-```shell
-npx -y @cubetiq/hlt config client new
+hlt start 3000
 ```
 
--   Set Client Token (Required, contact to vendor)
+**Give it a memorable name** (`https://myapp.example.com` instead of a random id)
 
 ```shell
-npx -y @cubetiq/hlt config token $TOKEN
+hlt start 3000 -n myapp
 ```
 
--   Set Custom Server
+**Reserve multiple names for one tunnel**
 
 ```shell
-npx -y @cubetiq/hlt config server https://lt.ctdn.net
+hlt start 3000 -n myapp,myapp-staging
 ```
 
--   Start Client
+**Forward to another host, not just localhost**
 
 ```shell
-npx -y @cubetiq/hlt start $YOUR_PORT
+hlt start 3000 -h 192.168.1.50
 ```
 
-### Contributors
+**Point at a full address directly**
 
--   Original [web-tunnel](https://github.com/web-tunnel/lite-http-tunnel-client)
--   Sambo Chea <sombochea@cubetiqs.com>
+```shell
+hlt start 192.168.1.50:8080
+```
+
+**Use a different server**
+
+```shell
+hlt config server https://your-server.com
+hlt start 3000
+```
+
+**Run multiple tunnels with separate identities** (profiles)
+
+```shell
+hlt init -p work
+hlt start 3000 -p work
+
+hlt init -p personal
+hlt start 4000 -p personal
+```
+
+**Receive webhooks locally**
+
+```shell
+hlt webhook --port 3000
+```
+
+**Local reverse proxy** (no tunnel, just forwards traffic on your machine)
+
+```shell
+hlt proxy 8080 https://api.example.com
+hlt proxy 8080 tcp://127.0.0.1:5432
+```
+
+## Config
+
+```shell
+hlt config server <url>       # set server URL
+hlt config token <token>      # set token manually
+hlt config token new          # request a fresh token from the server
+hlt config client <id>        # set client id (or "new" to generate one)
+hlt config key <apiKey>       # set API key
+hlt config-get <type>         # read back a config value
+hlt profile --list            # list saved profiles
+```
+
+Config is stored per profile under `~/.hlt/<profile>.json`.
+
+## Options reference (`hlt start`)
+
+| Flag | Description |
+| --- | --- |
+| `-p, --profile <name>` | profile to use (default: `default`) |
+| `-n, --name <names>` | comma-separated public tunnel names |
+| `-s, --suffix <string>` | suffix appended to the client name |
+| `-h, --host <string>` | local host to forward to (default: `localhost`) |
+| `-o, --origin <string>` | override request origin |
+| `-K, --keep_connection` | evict any existing connection on the same name (default: `true`) |
+| `-k, --key <string>` | client API key for authentication |
+
+## SDK usage
+
+```ts
+import { HltClient } from "@cubetiq/hlt";
+
+const hlt = new HltClient({ server: "https://your-server.com" });
+const tunnel = await hlt.connect({ port: 3000, names: ["myapp"] });
+
+console.log(tunnel.endpoint); // https://myapp.your-server.com
+
+// later
+tunnel.stop();
+```
+
+## Contributors
+
+- Sambo Chea <sombochea@cubis.tech>
