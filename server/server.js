@@ -774,7 +774,7 @@ app.use("/", (req, res) => {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>404 · Tunnel Not Found</title>
+  <title>404 · Not Found</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -840,7 +840,7 @@ app.use("/", (req, res) => {
   <div class="panel">
     <div class="header">
       <span class="code">404</span>
-      <h1>Tunnel Not Found</h1>
+      <h1>Not Found</h1>
     </div>
     <div class="host">${escapeHtml(host || "unknown-host")}</div>
     <p>No active tunnel client is connected for this address.</p>
@@ -849,7 +849,7 @@ app.use("/", (req, res) => {
 </html>`);
     } else {
       res.json({
-        error: "Tunnel Not Found",
+        error: "Not Found",
         status: 404,
         host: host,
         message: `No active tunnel client connected for host: '${host}'`,
@@ -950,9 +950,9 @@ httpServer.on("upgrade", (req, socket, head) => {
   const tunnelSocket = findTunnelSocket(req);
 
   if (!tunnelSocket) {
-    const errorBody = `Tunnel Not Found: No active tunnel client connected for host '${host}'\r\n`;
+    const errorBody = `Not Found: No active tunnel client connected for host '${host}'\r\n`;
     socket.write(
-      `HTTP/1.1 404 Tunnel Not Found\r\n` +
+      `HTTP/1.1 404 Not Found\r\n` +
       `Content-Type: text/plain; charset=utf-8\r\n` +
       `Content-Length: ${Buffer.byteLength(errorBody)}\r\n` +
       `Connection: close\r\n\r\n` +
@@ -1075,4 +1075,3 @@ if (process.env.IS_CLUSTER_WORKER !== "true") {
   process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
   process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 }
-
