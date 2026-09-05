@@ -141,6 +141,7 @@ class TunnelSocketManager {
       }
     };
     stream.once("close", onDone);
+    stream.once("finish", onDone);
     stream.once("end", onDone);
   }
 
@@ -179,6 +180,8 @@ class TunnelRequest extends Writable {
     this._requestId = requestId;
     this._manager = TunnelSocketManager.getOrCreate(socket);
     this._manager.registerRequest(requestId, this);
+    // Prevent unhandled error event if destroyed during client disconnect
+    this.on("error", () => {});
 
     this._socket.emit("request", requestId, request);
   }
@@ -235,6 +238,8 @@ class TunnelResponse extends Duplex {
     this._responseId = responseId;
     this._manager = TunnelSocketManager.getOrCreate(socket);
     this._manager.registerResponse(responseId, this);
+    // Prevent unhandled error event if destroyed during client disconnect
+    this.on("error", () => {});
   }
 
   handleResponse(data) {

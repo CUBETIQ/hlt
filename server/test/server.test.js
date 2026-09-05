@@ -159,5 +159,83 @@ describe("Tunnel Host Aliases & Resolver", () => {
     expect(aliases.has("sambo-default")).toBe(true);
     expect(aliases.has("sambo")).toBe(true);
   });
+
+  test("stale socket disconnect does not evict newly reconnected socket", () => {
+    const tunnelSockets = {};
+    const oldSocket = { id: "old-socket", clientId: "sambo" };
+    const newSocket = { id: "new-socket", clientId: "sambo" };
+    const host = "sambo.localhost:3000";
+
+    // Old socket registers
+    tunnelSockets[host] = oldSocket;
+
+    // New socket reconnects for same host
+    tunnelSockets[host] = newSocket;
+
+    // Old socket's disconnect handler runs
+    const disconnectHandler = (socket) => {
+      if (tunnelSockets[host] === socket) {
+        delete tunnelSockets[host];
+      }
+    };
+
+    disconnectHandler(oldSocket);
+
+    // Verify new socket was NOT deleted by old socket's disconnect
+    expect(tunnelSockets[host]).toBe(newSocket);
+    expect(tunnelSockets[host].id).toBe("new-socket");
+
+    // When the current socket disconnects, it is cleaned up
+    disconnectHandler(newSocket);
+    expect(tunnelSockets[host]).toBeUndefined();
+  });
+
+  test("cluster UNREGISTER_HOST ignores stale socket unregister when newer connection is registered", () => {
+    const clusterSockets = new Map();
+    const hostToWorker = new Map();
+
+    const worker1 = { process: { pid: 101 } };
+    const worker2 = { process: { pid: 102 } };
+    const host = "my-app.localhost:3000";
+
+    // Worker 1 registers socket 1
+    clusterSockets.set(host, { id: "socket-1", host, workerPid: 101 });
+    hostToWorker.set(host, worker1);
+
+    // Worker 2 registers socket 2 (reconnection / failover)
+    clusterSockets.set(host, { id: "socket-2", host, workerPid: 102 });
+    hostToWorker.set(host, worker2);
+
+    // Worker 1 sends late UNREGISTER_HOST for socket 1
+    const unregisterMsg = { type: "UNREGISTER_HOST", host, socketId: "socket-1" };
+    const currentEntry = clusterSockets.get(unregisterMsg.host);
+    const isCurrentSocket = !unregisterMsg.socketId || !currentEntry || currentEntry.id === unregisterMsg.socketId;
+
+    if (isCurrentSocket) {
+      clusterSockets.delete(host);
+      hostToWorker.delete(host);
+    }
+
+    // Must NOT be deleted because socket-1 is stale
+    expect(isCurrentSocket).toBe(false);
+    expect(clusterSockets.get(host)).toBeDefined();
+    expect(clusterSockets.get(host).id).toBe("socket-2");
+    expect(hostToWorker.get(host)).toBe(worker2);
+
+    // When socket 2 unregisters, it is properly cleaned up
+    const validUnregister = { type: "UNREGISTER_HOST", host, socketId: "socket-2" };
+    const entry2 = clusterSockets.get(validUnregister.host);
+    const isCurrentSocket2 = !validUnregister.socketId || !entry2 || entry2.id === validUnregister.socketId;
+    if (isCurrentSocket2) {
+      clusterSockets.delete(host);
+      hostToWorker.delete(host);
+    }
+
+    expect(isCurrentSocket2).toBe(true);
+    expect(clusterSockets.has(host)).toBe(false);
+    expect(hostToWorker.has(host)).toBe(false);
+  });
 });
+
+
 

@@ -214,7 +214,7 @@ HLT enforces JWT token authentication on every WebSocket connection:
 - When `PUBLIC_TOKEN_REGISTRATION=false`, clients must supply a matching `SERVER_API_KEY` to acquire tokens.
 - Sockets attempting to connect without a valid token signed by `SECRET_KEY` are rejected immediately with `401 Unauthorized`.
 
-### 2. Admin Management API (JWT Authenticated)
+### 2. Admin Management API
 
 The server exposes management routes under `/admin/api`:
 

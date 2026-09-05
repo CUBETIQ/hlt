@@ -320,20 +320,31 @@ io.on("connection", (socket) => {
   };
 
   const onDisconnect = (reason) => {
-    logger.info(`client disconnected from ${connectHost}:`, reason);
+    logger.info(`client disconnected from ${connectHost} (id: ${socket.id}):`, reason);
 
-    delete tunnelSockets[connectHost];
-    activePrimaryHosts.delete(connectHost);
+    // Only clean up if the current registered socket for this host is THIS socket.
+    // If a new socket reconnected and replaced tunnelSockets[connectHost], do NOT delete it!
+    if (tunnelSockets[connectHost] === socket) {
+      delete tunnelSockets[connectHost];
+      activePrimaryHosts.delete(connectHost);
+      stats.deleteStats(connectHost);
+      unregisterClientTunnel(socket.clientId, connectHost);
+    }
+
     aliases.forEach((alias) => {
-      delete tunnelSockets[alias];
-      aliasToPrimaryHost.delete(alias);
+      if (tunnelSockets[alias] === socket) {
+        delete tunnelSockets[alias];
+        aliasToPrimaryHost.delete(alias);
+      }
     });
 
-    stats.deleteStats(connectHost);
-    unregisterClientTunnel(socket.clientId, connectHost);
-
     if (process.send) {
-      process.send({ type: "UNREGISTER_HOST", host: connectHost, aliases });
+      process.send({
+        type: "UNREGISTER_HOST",
+        host: connectHost,
+        aliases,
+        socketId: socket.id,
+      });
     }
 
     socket.off("message", onMessage);
@@ -742,12 +753,108 @@ function getReqHeaders(req) {
   return headers;
 }
 
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 app.use("/", (req, res) => {
   const host = req.headers.host || "";
   const tunnelSocket = findTunnelSocket(req);
 
   if (!tunnelSocket) {
-    res.sendStatus(404);
+    res.status(404);
+    if (req.accepts("html")) {
+      res.type("html").send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>404 · Tunnel Not Found</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      background: #090d16;
+      color: #e2e8f0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 1.5rem;
+    }
+    .panel {
+      max-width: 440px;
+      width: 100%;
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 10px;
+      padding: 2rem;
+      text-align: left;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 1.25rem;
+    }
+    .code {
+      display: inline-block;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      color: #f43f5e;
+      background: rgba(244, 63, 94, 0.1);
+      border: 1px solid rgba(244, 63, 94, 0.25);
+      border-radius: 4px;
+      padding: 0.2rem 0.5rem;
+    }
+    h1 {
+      font-size: 1.125rem;
+      font-weight: 600;
+      color: #f8fafc;
+    }
+    .host {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.8125rem;
+      color: #38bdf8;
+      background: #020617;
+      border: 1px solid #1e293b;
+      border-radius: 6px;
+      padding: 0.625rem 0.875rem;
+      margin-bottom: 1rem;
+      word-break: break-all;
+    }
+    p {
+      font-size: 0.875rem;
+      color: #94a3b8;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <div class="header">
+      <span class="code">404</span>
+      <h1>Tunnel Not Found</h1>
+    </div>
+    <div class="host">${escapeHtml(host || "unknown-host")}</div>
+    <p>No active tunnel client is connected for this address.</p>
+  </div>
+</body>
+</html>`);
+    } else {
+      res.json({
+        error: "Tunnel Not Found",
+        status: 404,
+        host: host,
+        message: `No active tunnel client connected for host: '${host}'`,
+      });
+    }
     return;
   }
 
@@ -798,6 +905,9 @@ app.use("/", (req, res) => {
 
   tunnelResponse.once("requestError", onRequestError);
   tunnelResponse.once("response", onResponse);
+  tunnelResponse.on("error", (err) => {
+    cleanup(err);
+  });
   tunnelResponse.pipe(res);
 
   res.once("close", () => {
@@ -840,7 +950,14 @@ httpServer.on("upgrade", (req, socket, head) => {
   const tunnelSocket = findTunnelSocket(req);
 
   if (!tunnelSocket) {
-    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+    const errorBody = `Tunnel Not Found: No active tunnel client connected for host '${host}'\r\n`;
+    socket.write(
+      `HTTP/1.1 404 Tunnel Not Found\r\n` +
+      `Content-Type: text/plain; charset=utf-8\r\n` +
+      `Content-Length: ${Buffer.byteLength(errorBody)}\r\n` +
+      `Connection: close\r\n\r\n` +
+      errorBody
+    );
     socket.destroy();
     return;
   }

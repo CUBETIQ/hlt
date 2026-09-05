@@ -120,35 +120,49 @@ if (cluster.isPrimary || cluster.isMaster) {
             `[HLT Cluster] Host '${msg.host}' (client: ${cId}) registered on worker ${worker.process.pid}`
           );
         } else if (msg.type === "UNREGISTER_HOST" && msg.host) {
-          hostToWorker.delete(msg.host);
-          const hostWithoutPort = msg.host.split(":")[0];
-          if (hostWithoutPort !== msg.host) {
-            hostToWorker.delete(hostWithoutPort);
-          }
-          if (Array.isArray(msg.aliases)) {
-            msg.aliases.forEach((alias) => {
-              hostToWorker.delete(alias);
-              const aliasNoPort = alias.split(":")[0];
-              if (aliasNoPort !== alias) {
-                hostToWorker.delete(aliasNoPort);
-              }
-              workerHosts.get(worker)?.delete(alias);
-            });
-          }
-          workerHosts.get(worker)?.delete(msg.host);
-          clusterSockets.delete(msg.host);
-          clusterStats.total_disconnections++;
+          const currentEntry = clusterSockets.get(msg.host);
+          // If a new connection already replaced this host with a different socket ID or worker, do not evict it!
+          const isCurrentSocket = !msg.socketId || !currentEntry || currentEntry.id === msg.socketId;
 
-          for (const c of clusterClients.values()) {
-            if (c.activeHosts.has(msg.host)) {
-              c.activeHosts.delete(msg.host);
-              c.lastSeen = Date.now();
+          if (isCurrentSocket) {
+            if (hostToWorker.get(msg.host) === worker) {
+              hostToWorker.delete(msg.host);
             }
-          }
+            const hostWithoutPort = msg.host.split(":")[0];
+            if (hostWithoutPort !== msg.host && hostToWorker.get(hostWithoutPort) === worker) {
+              hostToWorker.delete(hostWithoutPort);
+            }
+            if (Array.isArray(msg.aliases)) {
+              msg.aliases.forEach((alias) => {
+                if (hostToWorker.get(alias) === worker) {
+                  hostToWorker.delete(alias);
+                }
+                const aliasNoPort = alias.split(":")[0];
+                if (aliasNoPort !== alias && hostToWorker.get(aliasNoPort) === worker) {
+                  hostToWorker.delete(aliasNoPort);
+                }
+                workerHosts.get(worker)?.delete(alias);
+              });
+            }
+            workerHosts.get(worker)?.delete(msg.host);
+            clusterSockets.delete(msg.host);
+            clusterStats.total_disconnections++;
 
-          logger.info(
-            `[HLT Cluster] Host '${msg.host}' unregistered from worker ${worker.process.pid}`
-          );
+            for (const c of clusterClients.values()) {
+              if (c.activeHosts.has(msg.host)) {
+                c.activeHosts.delete(msg.host);
+                c.lastSeen = Date.now();
+              }
+            }
+
+            logger.info(
+              `[HLT Cluster] Host '${msg.host}' unregistered from worker ${worker.process.pid}`
+            );
+          } else {
+            logger.info(
+              `[HLT Cluster] Ignored stale unregister for host '${msg.host}' from worker ${worker.process.pid} (replaced by socket ${currentEntry?.id})`
+            );
+          }
         } else if (msg.type === "RECORD_HTTP" && msg.host) {
           clusterStats.total_http_requests++;
           const hs = clusterStats.hostStats.get(msg.host);
@@ -289,8 +303,8 @@ if (cluster.isPrimary || cluster.isMaster) {
         socket.pause();
 
         const str = chunk.toString("latin1");
-        const hostFullMatch = str.match(/\r\nHost:\s*([^\r\n]+)\r\n/i);
-        const host = hostFullMatch ? hostFullMatch[1].trim() : null;
+        const hostMatch = str.match(/(?:^|\r?\n)host:\s*([^\r\n]+)/i);
+        const host = hostMatch ? hostMatch[1].trim() : null;
         const hostWithoutPort = host ? host.split(":")[0] : null;
 
         const isTunnelPath =
@@ -310,16 +324,35 @@ if (cluster.isPrimary || cluster.isMaster) {
           const sub = hostWithoutPort ? hostWithoutPort.split(".")[0] : null;
           if (sub && hostToWorker.has(sub)) {
             targetWorker = hostToWorker.get(sub);
-          } else if (
-            (hostWithoutPort === "localhost" || hostWithoutPort === "127.0.0.1") &&
-            clusterSockets.size === 1
-          ) {
-            // Local single-tunnel fallback: forward directly to the worker holding the only tunnel
-            const onlyHost = Array.from(clusterSockets.keys())[0];
-            targetWorker = hostToWorker.get(onlyHost) || getNextWorker();
-          } else {
-            // Default or unmatched request (e.g. /_/health, admin, 404)
-            targetWorker = getNextWorker();
+          } else if (sub && hostToWorker.has(`${sub}-`)) {
+            targetWorker = hostToWorker.get(`${sub}-`);
+          } else if (sub) {
+            // Find any registered alias starting with or matching sub
+            for (const [registeredKey, worker] of hostToWorker.entries()) {
+              if (
+                registeredKey === sub ||
+                registeredKey.startsWith(`${sub}-`) ||
+                sub.startsWith(`${registeredKey}-`) ||
+                sub.startsWith(registeredKey)
+              ) {
+                targetWorker = worker;
+                break;
+              }
+            }
+          }
+
+          if (!targetWorker) {
+            if (
+              (hostWithoutPort === "localhost" || hostWithoutPort === "127.0.0.1") &&
+              clusterSockets.size === 1
+            ) {
+              // Local single-tunnel fallback: forward directly to the worker holding the only tunnel
+              const onlyHost = Array.from(clusterSockets.keys())[0];
+              targetWorker = hostToWorker.get(onlyHost) || getNextWorker();
+            } else {
+              // Default or unmatched request (e.g. /_/health, admin, 404)
+              targetWorker = getNextWorker();
+            }
           }
         }
 
