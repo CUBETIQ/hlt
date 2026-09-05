@@ -239,6 +239,11 @@ io.on("connection", (socket) => {
   tunnelSockets[connectHost] = socket;
   logger.info(`client connected at: ${connectHost}`);
 
+  // Notify cluster primary if running in cluster worker mode
+  if (process.send) {
+    process.send({ type: "REGISTER_HOST", host: connectHost });
+  }
+
   // initialize the stats for connection socket with host
   stats.initStats(connectHost, socket);
 
@@ -263,6 +268,12 @@ io.on("connection", (socket) => {
   const onDisconnect = (reason) => {
     logger.info("client disconnected: ", reason);
     delete tunnelSockets[connectHost];
+    stats.deleteStats(connectHost); // Clean up stats memory
+
+    if (process.send) {
+      process.send({ type: "UNREGISTER_HOST", host: connectHost });
+    }
+
     socket.off("message", onMessage);
 
     //SDK:FORKED
@@ -375,6 +386,15 @@ adminRouter.get("/sockets", (req, res) => {
 
 adminRouter.delete("/sockets/:host", (req, res) => {
   const host = req.params.host;
+  const s = tunnelSockets[host];
+  if (s) {
+    delete tunnelSockets[host];
+    stats.deleteStats(host);
+    s.disconnect(true);
+  }
+  if (process.send) {
+    process.send({ type: "UNREGISTER_HOST", host: host });
+  }
   res.status(200);
   res.json({
     host: host,
@@ -491,59 +511,50 @@ app.use("/", (req, res) => {
     },
   });
 
-  const onReqError = (e) => {
-    tunnelRequest.destroy(new Error(e || "Aborted"));
-  };
-
-  req.once("aborted", onReqError);
-  req.once("error", onReqError);
-  req.pipe(tunnelRequest);
-  req.once("finish", () => {
-    req.off("aborted", onReqError);
-    req.off("error", onReqError);
-  });
-
   const tunnelResponse = new TunnelResponse({
     socket: tunnelSocket,
     responseId: requestId,
   });
 
-  const onRequestError = () => {
+  const cleanup = (err) => {
+    tunnelRequest.destroy(err);
+    tunnelResponse.destroy(err);
+  };
+
+  req.once("aborted", cleanup);
+  req.once("error", cleanup);
+  req.pipe(tunnelRequest);
+
+  const onRequestError = (err) => {
     tunnelResponse.off("response", onResponse);
-    tunnelResponse.destroy();
-    res.status(502);
-    res.end("Request error");
+    cleanup(err);
+    if (!res.headersSent) {
+      res.status(502).end("Bad Gateway / Tunnel Request Error");
+    }
   };
 
   const onResponse = ({ statusCode, statusMessage, headers }) => {
-    // save stats with http request
     stats.saveStats(host, tunnelSocket);
-
-    tunnelRequest.off("requestError", onRequestError);
-    res.writeHead(statusCode, statusMessage, headers);
+    tunnelResponse.off("requestError", onRequestError);
+    if (!res.headersSent) {
+      res.writeHead(statusCode, statusMessage, headers);
+    }
   };
 
   tunnelResponse.once("requestError", onRequestError);
   tunnelResponse.once("response", onResponse);
   tunnelResponse.pipe(res);
 
-  const onSocketError = () => {
-    res.off("close", onResClose);
-    res.status(500);
-    res.end("Socket error");
-  };
-
-  const onResClose = () => {
-    tunnelSocket.off("disconnect", onSocketError);
-  };
-
-  tunnelSocket.once("disconnect", onSocketError);
-  res.once("close", onResClose);
+  res.once("close", () => {
+    if (!res.writableEnded) {
+      cleanup(new Error("Response closed prematurely"));
+    }
+  });
 });
 
 function createSocketHttpHeader(line, headers) {
   return (
-    Object.keys(headers)
+    Object.keys(headers || {})
       .reduce(
         function (head, key) {
           var value = headers[key];
@@ -575,10 +586,10 @@ httpServer.on("upgrade", (req, socket, head) => {
   const tunnelSocket = tunnelSockets[host];
 
   if (!tunnelSocket) {
+    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+    socket.destroy();
     return;
   }
-
-  if (head && head.length) socket.unshift(head);
 
   const requestId = uuidV4();
   const tunnelRequest = new TunnelRequest({
@@ -591,71 +602,55 @@ httpServer.on("upgrade", (req, socket, head) => {
     },
   });
 
-  req.pipe(tunnelRequest);
-
   const tunnelResponse = new TunnelResponse({
     socket: tunnelSocket,
     responseId: requestId,
   });
 
+  const cleanup = (err) => {
+    tunnelRequest.destroy(err);
+    tunnelResponse.destroy(err);
+    socket.destroy(err);
+  };
+
   const onRequestError = () => {
     tunnelResponse.off("response", onResponse);
-    tunnelResponse.destroy();
-    socket.end();
+    cleanup();
   };
 
   const onResponse = ({ statusCode, statusMessage, headers, httpVersion }) => {
-    // save stats with http request
     stats.saveStatsWs(host, tunnelSocket);
-
     tunnelResponse.off("requestError", onRequestError);
-    if (statusCode) {
-      socket.once("error", (err) => {
-        logger.info(`WS ${req.url} ERROR`, err && err.message);
-        // ignore error
-      });
-      // not upgrade event
+
+    if (statusCode && statusCode !== 101) {
       socket.write(
         createSocketHttpHeader(
-          `HTTP/${httpVersion} ${statusCode} ${statusMessage}`,
-          headers,
+          `HTTP/${httpVersion || "1.1"} ${statusCode} ${statusMessage || ""}`,
+          headers || {},
         ),
       );
       tunnelResponse.pipe(socket);
       return;
     }
 
-    const onSocketError = (err) => {
-      logger.info(`WS ${req.url} ERROR`);
-      socket.off("end", onSocketEnd);
-      tunnelSocket.off("disconnect", onTunnelError);
-      tunnelResponse.destroy(err);
-    };
-
-    const onSocketEnd = () => {
-      logger.info(`WS ${req.url} END`);
-      socket.off("error", onSocketError);
-      tunnelSocket.off("disconnect", onTunnelError);
-      tunnelResponse.destroy();
-    };
-
-    const onTunnelError = () => {
-      logger.error("Tunnel socket got error!");
-      socket.off("error", onSocketError);
-      socket.off("end", onSocketEnd);
-      socket.end();
-      tunnelResponse.destroy();
-    };
-
-    socket.once("error", onSocketError);
-    socket.once("end", onSocketEnd);
-    tunnelSocket.once("disconnect", onTunnelError);
+    const responseHeaders = { ...(headers || {}) };
+    responseHeaders["Upgrade"] = responseHeaders["upgrade"] || "websocket";
+    responseHeaders["Connection"] = responseHeaders["connection"] || "Upgrade";
 
     socket.write(
-      createSocketHttpHeader("HTTP/1.1 101 Switching Protocols", headers),
+      createSocketHttpHeader("HTTP/1.1 101 Switching Protocols", responseHeaders),
     );
 
+    if (head && head.length) {
+      tunnelResponse.write(head);
+    }
+
     tunnelResponse.pipe(socket).pipe(tunnelResponse);
+
+    socket.once("error", (err) => cleanup(err));
+    socket.once("close", () => cleanup());
+    tunnelResponse.once("error", (err) => cleanup(err));
+    tunnelResponse.once("close", () => cleanup());
   };
 
   tunnelResponse.once("requestError", onRequestError);
@@ -663,7 +658,42 @@ httpServer.on("upgrade", (req, socket, head) => {
 });
 //////////////////// E HTTP Tunnel Client Router ////////////////////
 
-httpServer.listen(appConfig.port);
-logger.info(
-  `http tunnel server starting at: http://localhost:${appConfig.port}, trusted host: ${appConfig.trusted_host}`,
-);
+if (process.env.IS_CLUSTER_WORKER === "true") {
+  process.on("message", (msg, socket) => {
+    if (msg && msg.type === "STICKY_SOCKET" && socket) {
+      if (msg.head) {
+        socket.unshift(Buffer.from(msg.head));
+      }
+      socket.resume();
+      httpServer.emit("connection", socket);
+    }
+  });
+
+  httpServer.listen(0, "127.0.0.1", () => {
+    logger.info(`[HLT Worker ${process.pid}] ready to receive routed connections`);
+  });
+} else {
+  httpServer.listen(appConfig.port, () => {
+    logger.info(
+      `http tunnel server starting at: http://localhost:${appConfig.port}, trusted host: ${appConfig.trusted_host}`,
+    );
+  });
+}
+
+// Graceful shutdown handling
+const gracefulShutdown = (sig) => {
+  logger.info(`[HLT ${hostId}] Received ${sig}, closing server...`);
+  httpServer.close(() => {
+    logger.info(`[HLT ${hostId}] Server closed cleanly.`);
+    process.exit(0);
+  });
+  setTimeout(() => {
+    logger.error(`[HLT ${hostId}] Force exiting on shutdown timeout.`);
+    process.exit(1);
+  }, 5000);
+};
+
+if (process.env.IS_CLUSTER_WORKER !== "true") {
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+}

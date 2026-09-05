@@ -28,11 +28,14 @@ class HttpTunnelClient implements Client {
             return;
         }
 
-        this.keepAliveTimer = setTimeout(() => {
+        if (this.keepAliveTimer) {
+            clearInterval(this.keepAliveTimer);
+        }
+
+        this.keepAliveTimer = setInterval(() => {
             if (this.socket && this.socket.connected) {
                 this.socket.send("ping");
             }
-            this.keepAlive();
         }, this.keepAliveTimeout || 5000);
     }
 
@@ -196,32 +199,41 @@ class HttpTunnelClient implements Client {
         });
 
         this.socket.on("request", (requestId, request) => {
-            const isWebSocket = request.headers.upgrade === "websocket";
+            const upgradeHeader = (request.headers?.upgrade || "").toLowerCase();
+            const isWebSocket = upgradeHeader === "websocket";
             console.log(`${isWebSocket ? "WS" : request.method}: `, request.path);
             request.port = options.port;
-            request.hostname = options.host;
+            request.hostname = options.host || "localhost";
 
             if (options.origin) {
                 request.headers.host = options.origin;
             }
 
-            const tunnelRequest = new TunnelRequest(this.socket!, requestId);
+            // Ensure headers for Upgrade are formatted cleanly
+            if (isWebSocket) {
+                request.headers.connection = request.headers.connection || "Upgrade";
+                request.headers.upgrade = "websocket";
+            }
 
-            const localReq = http.request(request);
+            const tunnelRequest = new TunnelRequest(this.socket!, requestId);
+            let localReq: http.ClientRequest;
+            try {
+                localReq = http.request(request);
+            } catch (err: any) {
+                console.error("local request initialization error: ", err);
+                this.socket?.emit("request-error", requestId, err?.message || String(err));
+                tunnelRequest.destroy(err);
+                return;
+            }
+
             tunnelRequest.pipe(localReq);
 
             const onTunnelRequestError = (e: any) => {
                 console.error("tunnel request error: ", e);
-                tunnelRequest.off("end", onTunnelRequestEnd);
                 localReq.destroy(e);
             };
 
-            const onTunnelRequestEnd = () => {
-                tunnelRequest.off("error", onTunnelRequestError);
-            };
-
             tunnelRequest.once("error", onTunnelRequestError);
-            tunnelRequest.once("end", onTunnelRequestEnd);
 
             const onLocalResponse = (localRes: any) => {
                 localReq.off("error", onLocalError);
@@ -240,6 +252,10 @@ class HttpTunnelClient implements Client {
                 );
 
                 localRes.pipe(tunnelResponse);
+
+                localRes.on("error", (err: any) => {
+                    tunnelResponse.destroy(err);
+                });
             };
 
             const onLocalError = (error: any) => {
@@ -250,19 +266,39 @@ class HttpTunnelClient implements Client {
             };
 
             const onUpgrade = (localRes: any, localSocket: any, localHead: any) => {
-                // localSocket.once('error', onTunnelRequestError);
+                localReq.off("error", onLocalError);
                 if (localHead && localHead.length) localSocket.unshift(localHead);
 
                 const tunnelResponse = new TunnelResponse(this.socket!, requestId, true);
-                tunnelResponse.writeHead(null, null, localRes.headers);
+                tunnelResponse.writeHead(null, null, localRes.headers, localRes.httpVersion || "1.1");
+
                 localSocket.pipe(tunnelResponse).pipe(localSocket);
+
+                const cleanup = (err?: any) => {
+                    localSocket.destroy(err);
+                    tunnelResponse.destroy(err);
+                    tunnelRequest.destroy(err);
+                };
+
+                localSocket.once("error", (err: any) => {
+                    cleanup(err);
+                });
+                localSocket.once("close", () => {
+                    cleanup();
+                });
+                tunnelResponse.once("error", (err: any) => {
+                    cleanup(err);
+                });
+                tunnelResponse.once("close", () => {
+                    cleanup();
+                });
             };
 
             localReq.once("error", onLocalError);
             localReq.once("response", onLocalResponse);
 
             if (isWebSocket) {
-                localReq.on("upgrade", onUpgrade);
+                localReq.once("upgrade", onUpgrade);
             }
         });
 

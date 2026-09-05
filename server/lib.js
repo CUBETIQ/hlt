@@ -1,165 +1,327 @@
 const { Writable, Duplex } = require("stream");
 
+const DRAIN_THRESHOLD = 64 * 1024; // 64 KB buffer threshold
+const DRAIN_TIMEOUT = 5000; // 5s safety timeout to prevent drain hangs
+
+/**
+ * Helper to safely write/emit to a Socket.io socket with backpressure.
+ * Prevents memory bloat while avoiding the `socket.conn.once("drain")` deadlock
+ * when the Engine.io writeBuffer is already empty.
+ */
+function safeEmitWithDrain(socket, event, ...args) {
+  const callback = typeof args[args.length - 1] === "function" ? args.pop() : null;
+  socket.emit(event, ...args);
+
+  if (!callback) return;
+
+  const conn = socket.conn;
+  if (conn && conn.writeBuffer && conn.writeBuffer.length > DRAIN_THRESHOLD) {
+    let called = false;
+    let timer = null;
+
+    const done = () => {
+      if (called) return;
+      called = true;
+      if (timer) clearTimeout(timer);
+      callback();
+    };
+
+    timer = setTimeout(done, DRAIN_TIMEOUT);
+    conn.once("drain", done);
+  } else {
+    process.nextTick(callback);
+  }
+}
+
+/**
+ * Manages all active streams for a single tunnel socket.
+ * Registers ONLY ONE permanent listener per event on the socket,
+ * completely eliminating MaxListenersExceeded and O(N) listener loops.
+ */
+class TunnelSocketManager {
+  constructor(socket) {
+    this.socket = socket;
+    this.streams = new Map(); // id -> { requestStream, responseStream }
+
+    this._onResponse = (id, data) => {
+      const entry = this.streams.get(id);
+      if (entry && entry.responseStream) {
+        entry.responseStream.handleResponse(data);
+      }
+    };
+
+    this._onResponsePipe = (id, chunk) => {
+      const entry = this.streams.get(id);
+      if (entry && entry.responseStream) {
+        entry.responseStream.handleChunk(chunk);
+      }
+    };
+
+    this._onResponsePipes = (id, chunks) => {
+      const entry = this.streams.get(id);
+      if (entry && entry.responseStream) {
+        entry.responseStream.handleChunks(chunks);
+      }
+    };
+
+    this._onResponsePipeEnd = (id, chunk) => {
+      const entry = this.streams.get(id);
+      if (entry && entry.responseStream) {
+        entry.responseStream.handleEnd(chunk);
+      }
+    };
+
+    this._onResponsePipeError = (id, error) => {
+      const entry = this.streams.get(id);
+      if (entry && entry.responseStream) {
+        entry.responseStream.handleError(error);
+      }
+    };
+
+    this._onRequestError = (id, error) => {
+      const entry = this.streams.get(id);
+      if (entry && entry.responseStream) {
+        entry.responseStream.handleRequestError(error);
+      }
+    };
+
+    // Attach single persistent listeners
+    socket.on("response", this._onResponse);
+    socket.on("response-pipe", this._onResponsePipe);
+    socket.on("response-pipes", this._onResponsePipes);
+    socket.on("response-pipe-end", this._onResponsePipeEnd);
+    socket.on("response-pipe-error", this._onResponsePipeError);
+    socket.on("request-error", this._onRequestError);
+
+    this._onDisconnect = () => {
+      this.destroyAll(new Error("Socket disconnected"));
+      this.cleanup();
+    };
+    socket.once("disconnect", this._onDisconnect);
+  }
+
+  static getOrCreate(socket) {
+    if (!socket._tunnelManager) {
+      socket._tunnelManager = new TunnelSocketManager(socket);
+    }
+    return socket._tunnelManager;
+  }
+
+  registerRequest(id, stream) {
+    let entry = this.streams.get(id);
+    if (!entry) {
+      entry = {};
+      this.streams.set(id, entry);
+    }
+    entry.requestStream = stream;
+    const onDone = () => {
+      const cur = this.streams.get(id);
+      if (cur) {
+        cur.requestStream = null;
+        if (!cur.responseStream) this.streams.delete(id);
+      }
+    };
+    stream.once("close", onDone);
+    stream.once("finish", onDone);
+  }
+
+  registerResponse(id, stream) {
+    let entry = this.streams.get(id);
+    if (!entry) {
+      entry = {};
+      this.streams.set(id, entry);
+    }
+    entry.responseStream = stream;
+    const onDone = () => {
+      const cur = this.streams.get(id);
+      if (cur) {
+        cur.responseStream = null;
+        if (!cur.requestStream) this.streams.delete(id);
+      }
+    };
+    stream.once("close", onDone);
+    stream.once("end", onDone);
+  }
+
+  unregister(id) {
+    this.streams.delete(id);
+  }
+
+  destroyAll(err) {
+    for (const [id, entry] of this.streams.entries()) {
+      if (entry.requestStream && !entry.requestStream.destroyed) {
+        entry.requestStream.destroy(err);
+      }
+      if (entry.responseStream && !entry.responseStream.destroyed) {
+        entry.responseStream.destroy(err);
+      }
+    }
+    this.streams.clear();
+  }
+
+  cleanup() {
+    this.socket.off("response", this._onResponse);
+    this.socket.off("response-pipe", this._onResponsePipe);
+    this.socket.off("response-pipes", this._onResponsePipes);
+    this.socket.off("response-pipe-end", this._onResponsePipeEnd);
+    this.socket.off("response-pipe-error", this._onResponsePipeError);
+    this.socket.off("request-error", this._onRequestError);
+    this.socket.off("disconnect", this._onDisconnect);
+    this.socket._tunnelManager = null;
+  }
+}
+
 class TunnelRequest extends Writable {
   constructor({ socket, requestId, request }) {
-    super();
+    super({ highWaterMark: 64 * 1024 });
     this._socket = socket;
     this._requestId = requestId;
+    this._manager = TunnelSocketManager.getOrCreate(socket);
+    this._manager.registerRequest(requestId, this);
+
     this._socket.emit("request", requestId, request);
   }
 
   _write(chunk, encoding, callback) {
-    this._socket.emit("request-pipe", this._requestId, chunk);
-    this._socket.conn.once("drain", () => {
-      callback();
-    });
+    safeEmitWithDrain(
+      this._socket,
+      "request-pipe",
+      this._requestId,
+      chunk,
+      callback
+    );
   }
 
   _writev(chunks, callback) {
-    this._socket.emit("request-pipes", this._requestId, chunks);
-    this._socket.conn.once("drain", () => {
-      callback();
-    });
+    const data = chunks.map((c) => c.chunk);
+    safeEmitWithDrain(
+      this._socket,
+      "request-pipes",
+      this._requestId,
+      data,
+      callback
+    );
   }
 
   _final(callback) {
-    this._socket.emit("request-pipe-end", this._requestId);
-    this._socket.conn.once("drain", () => {
-      callback();
-    });
+    safeEmitWithDrain(
+      this._socket,
+      "request-pipe-end",
+      this._requestId,
+      callback
+    );
   }
 
   _destroy(e, callback) {
-    if (e) {
-      this._socket.emit("request-pipe-error", this._requestId, e && e.message);
-      this._socket.conn.once("drain", () => {
-        callback();
-      });
+    if (e && !this._socket.disconnected) {
+      safeEmitWithDrain(
+        this._socket,
+        "request-pipe-error",
+        this._requestId,
+        e.message || String(e),
+        () => callback(e)
+      );
       return;
     }
-    callback();
+    callback(e);
   }
 }
 
 class TunnelResponse extends Duplex {
   constructor({ socket, responseId }) {
-    super();
+    super({ highWaterMark: 64 * 1024 });
     this._socket = socket;
     this._responseId = responseId;
-
-    // Response Headers
-    const onResponse = (responseId, data) => {
-      if (this._responseId === responseId) {
-        this._socket.off("response", onResponse);
-        this._socket.off("request-error", onRequestError);
-        this.emit("response", {
-          statusCode: data.statusCode,
-          statusMessage: data.statusMessage,
-          headers: data.headers,
-          httpVersion: data.httpVersion,
-        });
-      }
-    };
-
-    const onResponsePipe = (responseId, data) => {
-      if (this._responseId === responseId) {
-        this.push(data);
-      }
-    };
-
-    const onResponsePipes = (responseId, data) => {
-      if (this._responseId === responseId) {
-        data.forEach((pipe) => {
-          var chunk = pipe?.chunk || pipe;
-          this.push(chunk);
-        });
-      }
-    };
-
-    const onResponsePipeError = (responseId, error) => {
-      if (this._responseId !== responseId) {
-        return;
-      }
-
-      this._socket.off("response-pipe", onResponsePipe);
-      this._socket.off("response-pipes", onResponsePipes);
-      this._socket.off("response-pipe-error", onResponsePipeError);
-      this._socket.off("response-pipe-end", onResponsePipeEnd);
-      this.destroy(new Error(error));
-    };
-
-    const onResponsePipeEnd = (responseId, data) => {
-      if (this._responseId !== responseId) {
-        return;
-      }
-      if (data) {
-        this.push(data);
-      }
-      this._socket.off("response-pipe", onResponsePipe);
-      this._socket.off("response-pipes", onResponsePipes);
-      this._socket.off("response-pipe-error", onResponsePipeError);
-      this._socket.off("response-pipe-end", onResponsePipeEnd);
-      this.push(null);
-    };
-
-    const onRequestError = (requestId, error) => {
-      if (requestId === this._responseId) {
-        this._socket.off("request-error", onRequestError);
-        this._socket.off("response", onResponse);
-        this._socket.off("response-pipe", onResponsePipe);
-        this._socket.off("response-pipes", onResponsePipes);
-        this._socket.off("response-pipe-error", onResponsePipeError);
-        this._socket.off("response-pipe-end", onResponsePipeEnd);
-        this.emit("requestError", error);
-      }
-    };
-
-    this._socket.on("response", onResponse);
-    this._socket.on("response-pipe", onResponsePipe);
-    this._socket.on("response-pipes", onResponsePipes);
-    this._socket.on("response-pipe-error", onResponsePipeError);
-    this._socket.on("response-pipe-end", onResponsePipeEnd);
-    this._socket.on("request-error", onRequestError);
+    this._manager = TunnelSocketManager.getOrCreate(socket);
+    this._manager.registerResponse(responseId, this);
   }
 
-  _read(size) { }
+  handleResponse(data) {
+    this.emit("response", {
+      statusCode: data.statusCode,
+      statusMessage: data.statusMessage,
+      headers: data.headers,
+      httpVersion: data.httpVersion,
+    });
+  }
+
+  handleChunk(chunk) {
+    if (chunk) {
+      this.push(chunk);
+    }
+  }
+
+  handleChunks(chunks) {
+    if (!chunks || !Array.isArray(chunks)) return;
+    for (const item of chunks) {
+      const chunk = item?.chunk || item;
+      if (chunk) this.push(chunk);
+    }
+  }
+
+  handleEnd(chunk) {
+    if (chunk) {
+      this.push(chunk);
+    }
+    this.push(null);
+  }
+
+  handleError(error) {
+    this.destroy(new Error(error || "Remote response error"));
+  }
+
+  handleRequestError(error) {
+    this.emit("requestError", error);
+  }
+
+  _read(size) {}
 
   _write(chunk, encoding, callback) {
-    this._socket.emit("response-pipe", this._responseId, chunk);
-    this._socket.conn.once("drain", () => {
-      callback();
-    });
+    safeEmitWithDrain(
+      this._socket,
+      "response-pipe",
+      this._responseId,
+      chunk,
+      callback
+    );
   }
 
   _writev(chunks, callback) {
-    this._socket.emit("response-pipes", this._responseId, chunks);
-    this._socket.conn.once("drain", () => {
-      callback();
-    });
+    const data = chunks.map((c) => c.chunk);
+    safeEmitWithDrain(
+      this._socket,
+      "response-pipes",
+      this._responseId,
+      data,
+      callback
+    );
   }
 
   _final(callback) {
-    this._socket.emit("response-pipe-end", this._responseId);
-    this._socket.conn.once("drain", () => {
-      callback();
-    });
+    safeEmitWithDrain(
+      this._socket,
+      "response-pipe-end",
+      this._responseId,
+      callback
+    );
   }
 
   _destroy(e, callback) {
-    if (e) {
-      this._socket.emit(
+    if (e && !this._socket.disconnected) {
+      safeEmitWithDrain(
+        this._socket,
         "response-pipe-error",
         this._responseId,
-        e && e.message
+        e.message || String(e),
+        () => callback(e)
       );
-      this._socket.conn.once("drain", () => {
-        callback();
-      });
       return;
     }
-    callback();
+    callback(e);
   }
 }
 
+exports.TunnelSocketManager = TunnelSocketManager;
 exports.TunnelRequest = TunnelRequest;
 exports.TunnelResponse = TunnelResponse;
+exports.safeEmitWithDrain = safeEmitWithDrain;

@@ -1,0 +1,42 @@
+name: Publish Client to NPM
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - "client-v*"
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "NPM release tag (e.g. latest, beta, next)"
+        required: true
+        default: "latest"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        working-directory: ./client
+        run: npm ci
+
+      - name: Build client
+        working-directory: ./client
+        run: npm run build
+
+      - name: Publish to NPM
+        working-directory: ./client
+        run: npm publish --access public --tag ${{ github.event.inputs.tag || 'latest' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

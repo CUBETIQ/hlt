@@ -24,12 +24,16 @@ const AppConfig = {
   security: {
     free_access_type: process.env.FREE_ACCESS_TYPE || "FREE",
     free_secret_key: process.env.FREE_SECRET_KEY,
-    free_verify_token: process.env.FREE_VERITY_TOKEN,
+    free_verify_token: process.env.FREE_VERIFY_TOKEN || process.env.FREE_VERITY_TOKEN,
   },
   socket: {
     max_http_buffer_size: process.env.MAX_HTTP_BUFFER_SIZE || (1e8 * 5), // 5M
     concurrency_limit: process.env.CONCURRENCY_LIMIT || 1000,
-  }
+  },
+  cluster: {
+    enabled: process.env.CLUSTER_ENABLED === "true" || process.env.NODE_CLUSTER === "true",
+    workers: process.env.WORKERS || "1",
+  },
 };
 
 module.exports = { AppConfig };

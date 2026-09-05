@@ -4,27 +4,31 @@
   "description": "A lightweight http tunnel server using nodejs and socket.io server.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node cluster.js",
+    "server": "node server.js",
     "test": "echo \"Hello Tests\""
   },
   "repository": {
     "type": "git",
     "url": "https://github.com/cubetiq/hlt.git"
   },
-  "keywords": ["http-tunnel-server", "socket.io"],
+  "keywords": [
+    "http-tunnel-server",
+    "socket.io"
+  ],
   "author": "Sambo Chea <sombochea@cubis.tech>",
   "license": "ISC",
   "dependencies": {
     "@socket.io/admin-ui": "^0.5.1",
     "@socket.io/redis-adapter": "^8.3.0",
-    "body-parser": "^1.20.2",
-    "dotenv": "^16.3.1",
-    "express": "^4.19.1",
-    "jsonwebtoken": "^9.0.2",
-    "morgan": "^1.10.0",
-    "redis": "^4.6.13",
-    "socket.io": "^4.7.5",
-    "uuid": "^9.0.1",
-    "winston": "^3.13.0"
+    "body-parser": "^2.3.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "morgan": "^1.12.0",
+    "redis": "^6.2.1",
+    "socket.io": "^4.8.3",
+    "uuid": "^14.0.2",
+    "winston": "^3.19.0"
   }
 }

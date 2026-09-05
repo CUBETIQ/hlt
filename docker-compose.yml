@@ -1,0 +1,68 @@
+services:
+  hlt-server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    image: cubetiq/hlt-server:latest
+    container_name: hlt-server
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - CLUSTER_ENABLED=${CLUSTER_ENABLED:-true}
+      - WORKERS=${WORKERS:-auto}
+      - TRUSTED_HOST=${TRUSTED_HOST:-localhost:3000}
+      - TRUSTED_SECRET=${TRUSTED_SECRET:-}
+      - SECRET_KEY=${SECRET_KEY:-change_this_secret_key_in_production}
+      - VERIFY_TOKEN=${VERIFY_TOKEN:-change_this_verify_token_in_production}
+      - FREE_ACCESS_TYPE=${FREE_ACCESS_TYPE:-FREE}
+      - FREE_SECRET_KEY=${FREE_SECRET_KEY:-change_this_free_secret_in_production}
+      - FREE_VERIFY_TOKEN=${FREE_VERIFY_TOKEN:-change_this_free_token_in_production}
+      - REDIS_ENABLED=${REDIS_ENABLED:-false}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - ADMIN_ENABLED=${ADMIN_ENABLED:-false}
+      - ADMIN_NAMESPACE=${ADMIN_NAMESPACE:-/admin}
+      - ADMIN_AUTH_ENABLED=${ADMIN_AUTH_ENABLED:-true}
+      - ADMIN_AUTH_TYPE=${ADMIN_AUTH_TYPE:-basic}
+      - ADMIN_AUTH_USERNAME=${ADMIN_AUTH_USERNAME:-admin}
+      - ADMIN_AUTH_PASSWORD=${ADMIN_AUTH_PASSWORD:-$$2b$$10$$uLYLbhGW7OnWW6mRye15puPrwzfvSe/WtDLSz8GdLw6FYHxaNlqb2}
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/_/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1); }).on('error', () => process.exit(1));"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      redis:
+        condition: service_healthy
+        required: false
+
+  redis:
+    image: redis:7-alpine
+    container_name: hlt-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  redis-data:

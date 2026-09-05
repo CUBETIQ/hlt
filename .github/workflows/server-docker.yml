@@ -1,0 +1,90 @@
+name: Build and Publish Server Docker Image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "server/**"
+      - ".github/workflows/server-docker.yml"
+    tags:
+      - "v*"
+      - "server-v*"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Custom Docker image tag (e.g. latest, 2.1.0)"
+        required: false
+        default: "latest"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/hlt-server
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU for multi-arch build
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=${{ github.event.inputs.image_tag }},enable=${{ github.event.inputs.image_tag != '' }}
+
+      - name: Generate build metadata JSON
+        id: build_flags
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "latest")
+          COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "-")
+          BUILD_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          FLAGS=$(jq -n -c \
+            --arg version "$VERSION" \
+            --arg commit "$COMMIT" \
+            --arg build_time "$BUILD_TIME" \
+            '{version: $version, commit: $commit, build_time: $build_time}')
+          echo "flags=$FLAGS" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./server
+          file: ./server/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            JSON_FLAGS=${{ steps.build_flags.outputs.flags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
