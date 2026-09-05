@@ -1,0 +1,407 @@
+import * as fs from "fs";
+import * as http from "http";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import * as os from "os";
+import * as path from "path";
+import { Socket, io } from "socket.io-client";
+import { TunnelRequest, TunnelResponse } from "./lib";
+import { addPrefixOnHttpSchema, generateUUID } from "./util";
+
+import { PROFILE_DEFAULT, PROFILE_PATH, SERVER_DEFAULT_URL, TOKEN_FREE } from "./constant";
+import { ClientOptions, Options } from "./interface";
+import { getTokenFree } from './sdk';
+
+interface Client {
+    getEndpoint(): string | null;
+    stop(): void;
+}
+
+class HttpTunnelClient implements Client {
+    // create socket instance
+    private socket: Socket | null = null;
+    private keepAliveTimer: NodeJS.Timeout | null = null;
+    private keepAliveTimeout: number | null = null;
+    private endpoint: string | null = null;
+
+    private keepAlive() {
+        if (!this.socket) {
+            return;
+        }
+
+        this.keepAliveTimer = setTimeout(() => {
+            if (this.socket && this.socket.connected) {
+                this.socket.send("ping");
+            }
+            this.keepAlive();
+        }, this.keepAliveTimeout || 5000);
+    }
+
+    // Init the Client for config file
+    public initConfigFile = async (options: any) => {
+        const profile = options.profile || PROFILE_DEFAULT;
+        const configDir = path.resolve(os.homedir(), PROFILE_PATH);
+
+        if (!fs.existsSync(configDir)) {
+            fs.mkdirSync(configDir);
+            console.log(`config file ${configDir} was created`);
+        }
+
+        let config: any = {};
+        const configFilename = `${profile}.json`;
+        const configFilePath = path.resolve(configDir, configFilename);
+
+        if (fs.existsSync(configFilePath)) {
+            config = JSON.parse(fs.readFileSync(configFilePath, "utf8"));
+        }
+
+        // Force reset config server from client init
+        if (!config.server || options.force) {
+            config.server = options.server || SERVER_DEFAULT_URL;
+        }
+
+        if (!config.token && options.token) {
+            config.token = options.token;
+        }
+
+        if (!config.access) {
+            config.access = options.access || TOKEN_FREE;
+        }
+
+        if (!config.clientId) {
+            config.clientId = options.client || generateUUID();
+        }
+
+        if (!config.apiKey && options.key) {
+            config.apiKey = options.key;
+        }
+
+        let errorCode = 0;
+        if (!config.token || options.force) {
+            console.log(`Generating token from server: ${config.server}`);
+            await getTokenFree(config.server, {
+                timestamp: (new Date().getTime()),
+                clientId: config.clientId,
+                apiKey: config.apiKey,
+            })
+                .then((resp: any) => {
+                    if (resp.data?.token) {
+                        console.log("Token generated successfully!");
+                        config.token = resp.data?.token;
+                    } else {
+                        errorCode = 1;
+                        console.error("Generate free token failed, return with null or empty from server!", resp);
+                        return;
+                    }
+                })
+                .catch((err: any) => {
+                    errorCode = 1;
+                    console.error("cannot get free token from server", err);
+                    return;
+                });
+        }
+
+        if (errorCode === 0) {
+            fs.writeFileSync(configFilePath, JSON.stringify(config, null, 2));
+            console.log(`initialized config saved successfully to: ${configFilePath}`);
+        }
+    };
+
+    // Start Client
+    public initStartClient = async (options: Options) => {
+        // Please change this if your domain goes wrong here
+        // Current style using sub-domain: https://{{clientId}}-tunnel.myhostingdomain.com
+        // (Original server: https://tunnel.myhostingdomain.com)
+        const profile = options.profile || PROFILE_DEFAULT;
+        const clientId = `${options.apiKey || options.clientId || generateUUID()}`;
+        const clientIdSub =
+            profile === PROFILE_DEFAULT ? `${clientId}-` : `${clientId}-${profile}-`;
+        const clientEndpoint = (
+            options.suffix ? `${clientIdSub}${options.suffix}-` : clientIdSub
+        )
+            .toLowerCase()
+            .trim();
+        const serverUrl = addPrefixOnHttpSchema(options.server || SERVER_DEFAULT_URL, clientEndpoint);
+        this.endpoint = serverUrl
+
+        // extra options for socket to identify the client (authentication and options of tunnel)
+        const defaultParams = {
+            apiKey: options.apiKey,
+            clientId: options.clientId,
+            profile: profile,
+            clientIdSub: clientIdSub,
+            clientEndpoint: clientEndpoint,
+            serverUrl: serverUrl,
+            access: options.access,
+            keep_connection: options.keep_connection || true,
+        };
+
+        // extra info for notify about the running of the tunnel (it's private info, other platfom cannot access this)
+        // this using for internal only (don't worry about this)
+        const osInfo = {
+            hostname: os.hostname(),
+            platform: os.platform(),
+            arch: os.arch(),
+            release: os.release(),
+            timestamp: new Date().getTime(),
+        };
+
+        const initParams: any = {
+            path: "/$cubetiq_http_tunnel",
+            transports: ["websocket"],
+            auth: {
+                token: options.token,
+                ...defaultParams,
+            },
+            headers: {
+                ...defaultParams,
+                os: osInfo,
+            },
+            // reconnection: true,
+        };
+
+        const http_proxy = process.env.https_proxy || process.env.http_proxy;
+        if (http_proxy) {
+            initParams.agent = new HttpsProxyAgent(http_proxy);
+        }
+
+        // Connecting to socket server and agent here...
+        console.log(`client connecting to server: ${serverUrl}`);
+        this.socket = io(serverUrl, initParams);
+
+        const clientLogPrefix = `client: ${clientId} on profile: ${profile}`;
+        this.socket.on("connect", () => {
+            if (this.socket!.connected) {
+                console.log(`${clientLogPrefix} is connected to server successfully!`);
+            }
+        });
+
+        this.socket.on("connect_error", (e) => {
+            console.error(
+                `${clientLogPrefix} connect error:`,
+                (e && e.message) || "something wrong"
+            );
+            if (e && e.message && e.message.startsWith("[40")) {
+                process.exit(1);
+            }
+        });
+
+        this.socket.on("disconnect", (reason) => {
+            console.warn(`${clientLogPrefix} disconnected: ${reason}!`);
+        });
+
+        this.socket.on("disconnect_exit", (reason) => {
+            console.warn(`${clientLogPrefix} disconnected and exited ${reason}!`);
+            this.socket?.disconnect();
+            process.exit(1);
+        });
+
+        this.socket.on("request", (requestId, request) => {
+            const isWebSocket = request.headers.upgrade === "websocket";
+            console.log(`${isWebSocket ? "WS" : request.method}: `, request.path);
+            request.port = options.port;
+            request.hostname = options.host;
+
+            if (options.origin) {
+                request.headers.host = options.origin;
+            }
+
+            const tunnelRequest = new TunnelRequest(this.socket!, requestId);
+
+            const localReq = http.request(request);
+            tunnelRequest.pipe(localReq);
+
+            const onTunnelRequestError = (e: any) => {
+                console.error("tunnel request error: ", e);
+                tunnelRequest.off("end", onTunnelRequestEnd);
+                localReq.destroy(e);
+            };
+
+            const onTunnelRequestEnd = () => {
+                tunnelRequest.off("error", onTunnelRequestError);
+            };
+
+            tunnelRequest.once("error", onTunnelRequestError);
+            tunnelRequest.once("end", onTunnelRequestEnd);
+
+            const onLocalResponse = (localRes: any) => {
+                localReq.off("error", onLocalError);
+
+                if (isWebSocket && localRes.upgrade) {
+                    return;
+                }
+
+                const tunnelResponse = new TunnelResponse(this.socket!, requestId);
+
+                tunnelResponse.writeHead(
+                    localRes.statusCode,
+                    localRes.statusMessage,
+                    localRes.headers,
+                    localRes.httpVersion
+                );
+
+                localRes.pipe(tunnelResponse);
+            };
+
+            const onLocalError = (error: any) => {
+                console.error("local error:", error);
+                localReq.off("response", onLocalResponse);
+                this.socket?.emit("request-error", requestId, error && error.message);
+                tunnelRequest.destroy(error);
+            };
+
+            const onUpgrade = (localRes: any, localSocket: any, localHead: any) => {
+                // localSocket.once('error', onTunnelRequestError);
+                if (localHead && localHead.length) localSocket.unshift(localHead);
+
+                const tunnelResponse = new TunnelResponse(this.socket!, requestId, true);
+                tunnelResponse.writeHead(null, null, localRes.headers);
+                localSocket.pipe(tunnelResponse).pipe(localSocket);
+            };
+
+            localReq.once("error", onLocalError);
+            localReq.once("response", onLocalResponse);
+
+            if (isWebSocket) {
+                localReq.on("upgrade", onUpgrade);
+            }
+        });
+
+        // reconnect manually
+        // const tryReconnect = () => {
+        //     setTimeout(() => {
+        //         socket!.io.open((err) => {
+        //             if (err) {
+        //                 tryReconnect();
+        //             }
+        //         });
+        //     }, 2000);
+        // };
+        // socket.io.on("close", tryReconnect);
+
+        this.keepAlive();
+    };
+
+    public start = async (clientOptions: Partial<ClientOptions>): Promise<Client | undefined> => {
+        const { port, address, options = {} } = clientOptions;
+
+        // Load host and port check
+        if (!port) {
+            if (!address) {
+                console.error("port or address is required!");
+                return;
+            }
+
+            const [host, portStr] = address.split(":");
+            if (!host || !portStr) {
+                console.error("invalid address!");
+                return;
+            }
+
+            options.host = host;
+            try {
+                options.port = parseInt(portStr);
+            } catch (e) {
+                console.error("invalid port!");
+                return;
+            }
+        } else {
+            if (typeof address !== "number" && address && address.includes(":")) {
+                const [host, portStr] = address.split(":");
+                if (host) {
+                    options.host = host;
+                }
+
+                if (portStr) {
+                    try {
+                        options.port = parseInt(portStr);
+                        console.log(`default port: ${port} will be ignored and override by port: ${options.port}`);
+                    } catch (e) {
+                        options.port = port;
+                    }
+                }
+            } else {
+                options.port = port;
+                console.log(`default port: ${port} will be forwared`);
+            }
+        }
+
+        const configDir = path.resolve(os.homedir(), PROFILE_PATH);
+
+        if (!fs.existsSync(configDir)) {
+            fs.mkdirSync(configDir);
+        }
+
+        let config: any = {};
+        const configFilename = `${options.profile || PROFILE_DEFAULT}.json`;
+        const configFilePath = path.resolve(configDir, configFilename);
+
+        if (fs.existsSync(configFilePath)) {
+            config = JSON.parse(fs.readFileSync(configFilePath, "utf8"));
+        } else {
+            if (options.autoinit) {
+                await this.initConfigFile(options);
+                config = JSON.parse(fs.readFileSync(configFilePath, "utf8"));
+            } else {
+                console.warn(`profile: ${options.profile || PROFILE_DEFAULT} not found!`);
+                return;
+            }
+        }
+
+        if (!config.server) {
+            config.server = SERVER_DEFAULT_URL;
+        }
+
+        if (!config.token) {
+            console.info(`please init or set token for ${config.server}`);
+            return;
+        }
+
+        if (!config.clientId) {
+            if (!config.apiKey) {
+                console.info(`please init or create a client for ${config.server}`);
+            } else {
+                config.clientId = config.apiKey;
+            }
+            return;
+        }
+
+        // options.port = port;
+        options.token = config.token;
+        options.access = config.access;
+        options.server = config.server;
+        options.clientId = config.clientId;
+        options.apiKey = options.key || config.apiKey;
+
+        if (options.suffix === "port" || options.suffix === "true") {
+            options.suffix = `${port}`;
+        } else if (options.suffix === "false") {
+            options.suffix = undefined;
+        } else if (options.suffix === "gen" || options.suffix === "uuid") {
+            options.suffix = generateUUID();
+        }
+
+        await this.initStartClient(options);
+        return this;
+    };
+
+    public stop = () => {
+        if (this.socket) {
+            this.socket.disconnect();
+            this.socket.close();
+            this.socket = null;
+            this.keepAliveTimer && clearInterval(this.keepAliveTimer);
+
+            console.log("client stopped from server:", this.endpoint);
+        }
+    };
+
+    public getEndpoint = () => {
+        return this.endpoint;
+    }
+}
+
+export const client = new HttpTunnelClient();
+
+export const initConfigFileClient = client.initConfigFile;
+export const startClient = client.start;
+export const stopClient = client.stop;

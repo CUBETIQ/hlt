@@ -1,0 +1,16 @@
+{
+    "compilerOptions": {
+        "lib": ["ES2015"],
+        "target": "es5",
+
+        "module": "commonjs",
+        "moduleResolution": "node",
+        "sourceMap": false,
+        "outDir": "dist",
+        "forceConsistentCasingInFileNames": true,
+        "strict": true,
+        "skipLibCheck": true,
+        "esModuleInterop": true
+    },
+    "exclude": ["node_modules", "dist", "test", "src/**/*.spec.ts"]
+}

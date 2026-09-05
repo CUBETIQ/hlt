@@ -1,0 +1,43 @@
+{
+  "name": "@cubetiq/hlt",
+  "version": "0.2.0",
+  "description": "A lightweight http tunnel client using nodejs and socket.io client",
+  "main": "dist/cli.js",
+  "bin": {
+    "hlt": "bin/hlt"
+  },
+  "scripts": {
+    "start": "ts-node-dev --respawn --transpile-only src/cli.ts",
+    "test": "ts-node-dev --respawn --transpile-only test/test.ts",
+    "local": "ts-node-dev --respawn --transpile-only src/cli.ts start -p local",
+    "build": "rimraf dist && tsc"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cubetiq/hlt.git"
+  },
+  "keywords": [
+    "http-tunnel-client",
+    "socket.io-client"
+  ],
+  "author": "Sambo Chea <sombochea@cubis.tech>",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.2.0",
+    "commander": "^12.0.0",
+    "express": "^4.18.2",
+    "http-proxy-middleware": "^2.0.6",
+    "https-proxy-agent": "^7.0.0",
+    "socket.io-client": "^4.5.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.15",
+    "@types/node": "^20.0.0",
+    "rimraf": "^5.0.1",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.0.0"
+  }
+}
