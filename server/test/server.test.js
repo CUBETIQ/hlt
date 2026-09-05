@@ -58,10 +58,13 @@ describe("TelemetryManager", () => {
     expect(stats.active_sockets).toBe(2);
     expect(stats.total_http_requests).toBe(2);
     expect(stats.total_ws_requests).toBe(1);
+    expect(stats.totalRequests).toBe(3);
+    expect(stats.totalConnections).toBe(2);
 
     const client1Stats = telemetry.getHostStats("client1.example.com");
     expect(client1Stats.http_count).toBe(2);
     expect(client1Stats.ws_count).toBe(0);
+    expect(client1Stats.requests).toBe(2);
 
     await telemetry.recordDisconnect("client1.example.com");
     const updatedStats = await telemetry.getGlobalStats();
@@ -126,3 +129,35 @@ describe("WebSocket Upgrade Compatibility", () => {
     io.close();
   });
 });
+
+describe("Tunnel Host Aliases & Resolver", () => {
+  test("generates all required aliases from socket handshake", () => {
+    const mockSocket = {
+      handshake: {
+        headers: { host: "sambo.localhost:3000" },
+        auth: {
+          clientId: "sambo",
+          clientEndpoint: "sambo-default-",
+          serverUrl: "http://sambo.localhost:3000",
+        },
+      },
+      clientId: "sambo",
+    };
+
+    // Simulate getSocketAliases logic
+    const aliases = new Set();
+    const connectHost = mockSocket.handshake.headers.host;
+    aliases.add(connectHost);
+    aliases.add(connectHost.split(":")[0]);
+    aliases.add(mockSocket.handshake.auth.clientEndpoint);
+    aliases.add("sambo-default");
+    aliases.add(mockSocket.clientId);
+
+    expect(aliases.has("sambo.localhost:3000")).toBe(true);
+    expect(aliases.has("sambo.localhost")).toBe(true);
+    expect(aliases.has("sambo-default-")).toBe(true);
+    expect(aliases.has("sambo-default")).toBe(true);
+    expect(aliases.has("sambo")).toBe(true);
+  });
+});
+

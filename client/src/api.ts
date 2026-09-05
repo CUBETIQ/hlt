@@ -16,6 +16,22 @@ export interface Client {
     stop(): void;
 }
 
+function formatBytes(bytes: number): string {
+    if (!bytes || bytes <= 0) return "0 B";
+    const units = ["B", "KB", "MB", "GB"];
+    const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+    return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function colorStatus(status: number): string {
+    const code = String(status);
+    if (status >= 500) return `\x1b[31m${code}\x1b[0m`; // Red
+    if (status >= 400) return `\x1b[33m${code}\x1b[0m`; // Yellow
+    if (status >= 300) return `\x1b[36m${code}\x1b[0m`; // Cyan
+    if (status >= 200) return `\x1b[32m${code}\x1b[0m`; // Green
+    return `\x1b[37m${code}\x1b[0m`;
+}
+
 export class HttpTunnelClient implements Client {
     // create socket instance
     private socket: Socket | null = null;
@@ -37,6 +53,7 @@ export class HttpTunnelClient implements Client {
                 this.socket.send("ping");
             }
         }, this.keepAliveTimeout || 5000);
+        this.keepAliveTimer.unref?.();
     }
 
     // Init the Client for config file
@@ -169,7 +186,10 @@ export class HttpTunnelClient implements Client {
         const clientLogPrefix = `client: ${clientId} on profile: ${profile}`;
         this.socket.on("connect", () => {
             if (this.socket!.connected) {
-                console.log(`${clientLogPrefix} is connected to server successfully!`);
+                console.log(`\x1b[32m✔ ${clientLogPrefix} is connected to server successfully!\x1b[0m`);
+                const targetHost = options.host || "localhost";
+                const targetPort = options.port;
+                console.log(`\x1b[36m➜ Forwarding:\x1b[0m ${this.endpoint} -> http://${targetHost}:${targetPort}`);
             }
         });
 
@@ -185,20 +205,38 @@ export class HttpTunnelClient implements Client {
 
         this.socket.on("disconnect", (reason) => {
             console.warn(`${clientLogPrefix} disconnected: ${reason}!`);
+            if (reason === "io server disconnect") {
+                if (this.keepAliveTimer) {
+                    clearInterval(this.keepAliveTimer);
+                    this.keepAliveTimer = null;
+                }
+                this.socket?.disconnect();
+                if ((options as any).exitOnError !== false) {
+                    process.exit(0);
+                }
+            }
         });
 
         this.socket.on("disconnect_exit", (reason) => {
-            console.warn(`${clientLogPrefix} disconnected and exited ${reason}!`);
+            console.warn(`\x1b[33m${clientLogPrefix} disconnected and terminated: ${reason}!\x1b[0m`);
+            if (this.keepAliveTimer) {
+                clearInterval(this.keepAliveTimer);
+                this.keepAliveTimer = null;
+            }
             this.socket?.disconnect();
             if ((options as any).exitOnError !== false) {
-                process.exit(1);
+                process.exit(0);
             }
         });
 
         this.socket.on("request", (requestId, request) => {
             const upgradeHeader = (request.headers?.upgrade || "").toLowerCase();
             const isWebSocket = upgradeHeader === "websocket";
-            console.log(`${isWebSocket ? "WS" : request.method}: `, request.path);
+            const startTime = Date.now();
+
+            const rawIp = request.headers?.["x-forwarded-for"] || request.headers?.["x-real-ip"] || "127.0.0.1";
+            const clientIp = typeof rawIp === "string" ? rawIp.split(",")[0].trim() : "127.0.0.1";
+
             request.port = options.port;
             request.hostname = options.host || "localhost";
 
@@ -213,11 +251,22 @@ export class HttpTunnelClient implements Client {
             }
 
             const tunnelRequest = new TunnelRequest(this.socket!, requestId);
+            let reqBytes = 0;
+            tunnelRequest.on("data", (chunk: any) => {
+                if (chunk && chunk.length) {
+                    reqBytes += chunk.length;
+                }
+            });
+
             let localReq: http.ClientRequest;
             try {
                 localReq = http.request(request);
             } catch (err: any) {
-                console.error("local request initialization error: ", err);
+                const duration = Date.now() - startTime;
+                console.error(
+                    `${colorStatus(502)} Bad Gateway \x1b[1m${isWebSocket ? "WS" : request.method}\x1b[0m ${request.path} ` +
+                    `from \x1b[36m${clientIp}\x1b[0m [\x1b[31m${err?.message || String(err)}\x1b[0m] \x1b[90m(${duration}ms)\x1b[0m`
+                );
                 this.socket?.emit("request-error", requestId, err?.message || String(err));
                 tunnelRequest.destroy(err);
                 return;
@@ -226,7 +275,11 @@ export class HttpTunnelClient implements Client {
             tunnelRequest.pipe(localReq);
 
             const onTunnelRequestError = (e: any) => {
-                console.error("tunnel request error: ", e);
+                const duration = Date.now() - startTime;
+                console.error(
+                    `${colorStatus(502)} Tunnel Request Error \x1b[1m${isWebSocket ? "WS" : request.method}\x1b[0m ${request.path} ` +
+                    `from \x1b[36m${clientIp}\x1b[0m [\x1b[31m${e?.message || String(e)}\x1b[0m] \x1b[90m(${duration}ms)\x1b[0m`
+                );
                 localReq.destroy(e);
             };
 
@@ -239,6 +292,13 @@ export class HttpTunnelClient implements Client {
                     return;
                 }
 
+                let resBytes = 0;
+                localRes.on("data", (chunk: any) => {
+                    if (chunk && chunk.length) {
+                        resBytes += chunk.length;
+                    }
+                });
+
                 const tunnelResponse = new TunnelResponse(this.socket!, requestId);
 
                 tunnelResponse.writeHead(
@@ -250,13 +310,32 @@ export class HttpTunnelClient implements Client {
 
                 localRes.pipe(tunnelResponse);
 
+                localRes.once("end", () => {
+                    const duration = Date.now() - startTime;
+                    const statusStr = colorStatus(localRes.statusCode || 200);
+                    const statusMsg = localRes.statusMessage || "";
+                    const reqLen = formatBytes(reqBytes || parseInt(request.headers?.["content-length"] || "0", 10));
+                    const resLen = formatBytes(resBytes || parseInt(localRes.headers?.["content-length"] || "0", 10));
+
+                    console.log(
+                        `${statusStr} ${statusMsg ? statusMsg + " " : ""}\x1b[1m${request.method}\x1b[0m ${request.path} ` +
+                        `from \x1b[36m${clientIp}\x1b[0m ` +
+                        `[\x1b[90min:\x1b[0m ${reqLen} | \x1b[90mout:\x1b[0m ${resLen}] ` +
+                        `\x1b[90m(${duration}ms)\x1b[0m`
+                    );
+                });
+
                 localRes.on("error", (err: any) => {
                     tunnelResponse.destroy(err);
                 });
             };
 
             const onLocalError = (error: any) => {
-                console.error("local error:", error);
+                const duration = Date.now() - startTime;
+                console.error(
+                    `${colorStatus(502)} Bad Gateway \x1b[1m${isWebSocket ? "WS" : request.method}\x1b[0m ${request.path} ` +
+                    `from \x1b[36m${clientIp}\x1b[0m [\x1b[31m${error?.message || error}\x1b[0m] \x1b[90m(${duration}ms)\x1b[0m`
+                );
                 localReq.off("response", onLocalResponse);
                 this.socket?.emit("request-error", requestId, error && error.message);
                 tunnelRequest.destroy(error);
@@ -268,6 +347,16 @@ export class HttpTunnelClient implements Client {
 
                 const tunnelResponse = new TunnelResponse(this.socket!, requestId, true);
                 tunnelResponse.writeHead(null, null, localRes.headers, localRes.httpVersion || "1.1");
+
+                let wsInBytes = 0;
+                let wsOutBytes = 0;
+                localSocket.on("data", (chunk: any) => { wsOutBytes += chunk?.length || 0; });
+                tunnelResponse.on("data", (chunk: any) => { wsInBytes += chunk?.length || 0; });
+
+                console.log(
+                    `\x1b[32m101\x1b[0m Switching Protocols \x1b[1mWS\x1b[0m ${request.path} ` +
+                    `from \x1b[36m${clientIp}\x1b[0m \x1b[90m(upgraded)\x1b[0m`
+                );
 
                 localSocket.pipe(tunnelResponse).pipe(localSocket);
 
@@ -281,6 +370,11 @@ export class HttpTunnelClient implements Client {
                     cleanup(err);
                 });
                 localSocket.once("close", () => {
+                    const duration = Date.now() - startTime;
+                    console.log(
+                        `\x1b[90mWS ${request.path} closed from ${clientIp} ` +
+                        `[in: ${formatBytes(wsInBytes)} | out: ${formatBytes(wsOutBytes)}] (${duration}ms)\x1b[0m`
+                    );
                     cleanup();
                 });
                 tunnelResponse.once("error", (err: any) => {

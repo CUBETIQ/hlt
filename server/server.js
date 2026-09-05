@@ -77,8 +77,165 @@ if (redisConfig && redisConfig.enabled && redisConfig.url) {
   });
 }
 
-// Active tunnel sockets map
+// Active tunnel sockets map and alias resolution
 const tunnelSockets = {};
+// Map alias -> primary host string
+const aliasToPrimaryHost = new Map();
+// Set of active primary hosts
+const activePrimaryHosts = new Set();
+
+function getSocketAliases(socket) {
+  const aliases = new Set();
+  const connectHost = socket.handshake.headers.host;
+  const auth = socket.handshake.auth || {};
+  const headers = socket.handshake.headers || {};
+
+  if (connectHost) {
+    aliases.add(connectHost);
+    aliases.add(connectHost.split(":")[0]);
+  }
+
+  const clientEndpoint = auth.clientEndpoint || headers.clientendpoint || headers["client-endpoint"];
+  if (clientEndpoint) {
+    aliases.add(clientEndpoint);
+    if (clientEndpoint.endsWith("-")) {
+      aliases.add(clientEndpoint.slice(0, -1));
+    }
+  }
+
+  const clientId = socket.clientId || auth.clientId;
+  if (clientId) {
+    aliases.add(clientId);
+  }
+
+  const serverUrl = auth.serverUrl || headers.serverurl;
+  if (serverUrl) {
+    try {
+      const parsed = new URL(serverUrl);
+      if (parsed.host) aliases.add(parsed.host);
+      if (parsed.hostname) aliases.add(parsed.hostname);
+    } catch {}
+  }
+
+  return Array.from(aliases).filter(Boolean);
+}
+
+function findTunnelSocket(req) {
+  const hostHeader = (req.headers && req.headers.host) || "";
+  const host = hostHeader.trim();
+  const hostWithoutPort = host.split(":")[0];
+  const configuredPort = appConfig.port ? String(appConfig.port) : null;
+
+  // 1. Direct host match in tunnelSockets
+  if (host && tunnelSockets[host]) return tunnelSockets[host];
+  if (hostWithoutPort && tunnelSockets[hostWithoutPort]) return tunnelSockets[hostWithoutPort];
+  if (configuredPort && tunnelSockets[`${hostWithoutPort}:${configuredPort}`]) {
+    return tunnelSockets[`${hostWithoutPort}:${configuredPort}`];
+  }
+
+  // 2. Check alias map
+  if (host && aliasToPrimaryHost.has(host)) {
+    const primary = aliasToPrimaryHost.get(host);
+    if (primary && tunnelSockets[primary]) return tunnelSockets[primary];
+  }
+  if (hostWithoutPort && aliasToPrimaryHost.has(hostWithoutPort)) {
+    const primary = aliasToPrimaryHost.get(hostWithoutPort);
+    if (primary && tunnelSockets[primary]) return tunnelSockets[primary];
+  }
+
+  // 3. Forwarded host headers
+  const fwdHost = req.headers["x-forwarded-host"] || req.headers["x-tunnel-host"];
+  if (fwdHost) {
+    const fwdClean = String(fwdHost).split(",")[0].trim();
+    const fwdWithoutPort = fwdClean.split(":")[0];
+    if (tunnelSockets[fwdClean]) return tunnelSockets[fwdClean];
+    if (tunnelSockets[fwdWithoutPort]) return tunnelSockets[fwdWithoutPort];
+    if (aliasToPrimaryHost.has(fwdClean) && tunnelSockets[aliasToPrimaryHost.get(fwdClean)]) {
+      return tunnelSockets[aliasToPrimaryHost.get(fwdClean)];
+    }
+    if (aliasToPrimaryHost.has(fwdWithoutPort) && tunnelSockets[aliasToPrimaryHost.get(fwdWithoutPort)]) {
+      return tunnelSockets[aliasToPrimaryHost.get(fwdWithoutPort)];
+    }
+  }
+
+  // 4. Subdomain prefix extraction (e.g. "client1.localhost:3000" or "client1-tunnel.example.com")
+  const parts = hostWithoutPort.split(".");
+  if (parts.length > 1) {
+    const sub = parts[0];
+    if (tunnelSockets[sub]) return tunnelSockets[sub];
+    if (aliasToPrimaryHost.has(sub) && tunnelSockets[aliasToPrimaryHost.get(sub)]) {
+      return tunnelSockets[aliasToPrimaryHost.get(sub)];
+    }
+    // Subdomain with trailing dash match
+    if (tunnelSockets[`${sub}-`]) return tunnelSockets[`${sub}-`];
+    if (aliasToPrimaryHost.has(`${sub}-`) && tunnelSockets[aliasToPrimaryHost.get(`${sub}-`)]) {
+      return tunnelSockets[aliasToPrimaryHost.get(`${sub}-`)];
+    }
+  }
+
+  // 5. Explicit client ID query param or header
+  const explicitClient = (req.query && (req.query._tunnel || req.query._client)) || req.headers["x-client-id"];
+  if (explicitClient) {
+    const cKey = String(explicitClient).trim();
+    if (tunnelSockets[cKey]) return tunnelSockets[cKey];
+    if (aliasToPrimaryHost.has(cKey) && tunnelSockets[aliasToPrimaryHost.get(cKey)]) {
+      return tunnelSockets[aliasToPrimaryHost.get(cKey)];
+    }
+  }
+
+  // 6. Scan active sockets by metadata (clientId, clientEndpoint)
+  for (const s of Object.values(tunnelSockets)) {
+    if (!s || !s.connected) continue;
+    const auth = s.handshake?.auth || {};
+    if (auth.clientId === host || auth.clientId === hostWithoutPort) return s;
+    if (auth.clientEndpoint === host || auth.clientEndpoint === `${host}-`) return s;
+    if (s.clientId === host || s.clientId === hostWithoutPort) return s;
+  }
+
+  // 7. Localhost Single-tunnel Fallback:
+  // When testing locally (request sent to localhost or 127.0.0.1) and exactly 1 tunnel is connected,
+  // route to that tunnel so developers don't need custom local DNS entries!
+  const isLocalRequest = hostWithoutPort === "localhost" || hostWithoutPort === "127.0.0.1";
+  if (isLocalRequest && activePrimaryHosts.size === 1) {
+    const onlyHost = Array.from(activePrimaryHosts)[0];
+    if (onlyHost && tunnelSockets[onlyHost]) {
+      return tunnelSockets[onlyHost];
+    }
+  }
+
+  return null;
+}
+
+// Client tracking registry
+const clientRegistry = new Map();
+
+function registerClientTunnel(clientId, host) {
+  const cId = clientId || "anonymous";
+  let client = clientRegistry.get(cId);
+  if (!client) {
+    client = {
+      clientId: cId,
+      totalTunnelsCreated: 0,
+      activeHosts: new Set(),
+      firstSeen: Date.now(),
+      lastSeen: Date.now(),
+    };
+    clientRegistry.set(cId, client);
+  }
+  client.totalTunnelsCreated++;
+  client.activeHosts.add(host);
+  client.lastSeen = Date.now();
+  return client;
+}
+
+function unregisterClientTunnel(clientId, host) {
+  const cId = clientId || "anonymous";
+  const client = clientRegistry.get(cId);
+  if (client) {
+    client.activeHosts.delete(host);
+    client.lastSeen = Date.now();
+  }
+}
 
 // Unified Socket.io Authentication Middleware
 io.use((socket, next) => {
@@ -112,7 +269,9 @@ io.use((socket, next) => {
           `socket: ${existsSocket.id} replaced by new connection for host: ${connectHost}`,
         );
         delete tunnelSockets[connectHost];
+        activePrimaryHosts.delete(connectHost);
         stats.deleteStats(connectHost);
+        unregisterClientTunnel(existsSocket.clientId, connectHost);
         existsSocket.disconnect(true);
         existsSocket.removeAllListeners();
         return next();
@@ -126,12 +285,29 @@ io.use((socket, next) => {
 
 io.on("connection", (socket) => {
   const connectHost = socket.handshake.headers.host;
+  const aliases = getSocketAliases(socket);
+
   tunnelSockets[connectHost] = socket;
-  logger.info(`client connected at: ${connectHost} (id: ${socket.id})`);
+  activePrimaryHosts.add(connectHost);
+
+  // Register all aliases pointing to this socket
+  aliases.forEach((alias) => {
+    tunnelSockets[alias] = socket;
+    aliasToPrimaryHost.set(alias, connectHost);
+  });
+
+  registerClientTunnel(socket.clientId, connectHost);
+  logger.info(`client connected at: ${connectHost} (id: ${socket.id}, client: ${socket.clientId || "anonymous"}, aliases: [${aliases.join(", ")}])`);
 
   // Notify cluster primary if in multi-worker mode
   if (process.send) {
-    process.send({ type: "REGISTER_HOST", host: connectHost });
+    process.send({
+      type: "REGISTER_HOST",
+      host: connectHost,
+      aliases: aliases,
+      id: socket.id,
+      clientId: socket.clientId || null,
+    });
   }
 
   // Record privacy-first connection telemetry
@@ -145,11 +321,19 @@ io.on("connection", (socket) => {
 
   const onDisconnect = (reason) => {
     logger.info(`client disconnected from ${connectHost}:`, reason);
+
     delete tunnelSockets[connectHost];
+    activePrimaryHosts.delete(connectHost);
+    aliases.forEach((alias) => {
+      delete tunnelSockets[alias];
+      aliasToPrimaryHost.delete(alias);
+    });
+
     stats.deleteStats(connectHost);
+    unregisterClientTunnel(socket.clientId, connectHost);
 
     if (process.send) {
-      process.send({ type: "UNREGISTER_HOST", host: connectHost });
+      process.send({ type: "UNREGISTER_HOST", host: connectHost, aliases });
     }
 
     socket.off("message", onMessage);
@@ -262,34 +446,98 @@ const adminAuthMiddleware = (req, res, next) => {
   });
 };
 
+// Cluster IPC Coordination
+const pendingClusterRequests = new Map();
+if (process.on) {
+  process.on("message", (msg) => {
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "CLUSTER_STATE_RES" && msg.reqId) {
+      const cb = pendingClusterRequests.get(msg.reqId);
+      if (cb) {
+        pendingClusterRequests.delete(msg.reqId);
+        cb(msg);
+      }
+    } else if (msg.type === "DO_DISCONNECT_SOCKET" && msg.host) {
+      const s = tunnelSockets[msg.host];
+      if (s) {
+        try {
+          s.emit("disconnect_exit", "Disconnected by administrator");
+        } catch {}
+        delete tunnelSockets[msg.host];
+        stats.deleteStats(msg.host);
+        unregisterClientTunnel(s.clientId, msg.host);
+        s.disconnect(true);
+      }
+    }
+  });
+}
+
+function getClusterState(timeout = 1000) {
+  const localSockets = Object.keys(tunnelSockets || {}).map((host) => {
+    const socket = tunnelSockets[host];
+    return {
+      id: socket.id,
+      host: host,
+      clientId: socket.clientId || null,
+      connected: socket.connected,
+      stats: stats.getHostStats(host),
+    };
+  });
+
+  if (!process.send) {
+    return Promise.resolve({
+      sockets: localSockets,
+      clients: null,
+      stats: null,
+    });
+  }
+
+  return new Promise((resolve) => {
+    const reqId = uuidV4();
+    const timer = setTimeout(() => {
+      pendingClusterRequests.delete(reqId);
+      resolve({ sockets: localSockets, clients: null, stats: null });
+    }, timeout);
+
+    pendingClusterRequests.set(reqId, (res) => {
+      clearTimeout(timer);
+      resolve(res);
+    });
+
+    try {
+      process.send({ type: "GET_CLUSTER_STATE", reqId });
+    } catch {
+      clearTimeout(timer);
+      pendingClusterRequests.delete(reqId);
+      resolve({ sockets: localSockets, clients: null, stats: null });
+    }
+  });
+}
+
 // Admin Management Endpoints
 adminRouter.get("/status", adminAuthMiddleware, async (req, res) => {
-  const globalStats = await stats.getGlobalStats();
+  const clusterData = await getClusterState();
+  const baseStats = await stats.getGlobalStats();
+  const combinedStats = (clusterData.stats && !redisConfig?.enabled)
+    ? { ...baseStats, ...clusterData.stats }
+    : baseStats;
+
   res.status(200).json({
     instance: hostId,
     uptime: process.uptime(),
     cpuUsage: process.cpuUsage(),
     memoryUsage: process.memoryUsage(),
     build: buildInfo,
-    stats: globalStats,
-    activeSocketsCount: Object.keys(tunnelSockets || {}).length,
+    stats: combinedStats,
+    activeSocketsCount: clusterData.sockets.length,
   });
 });
 
-adminRouter.get("/sockets", adminAuthMiddleware, (req, res) => {
-  const socketsKeys = Object.keys(tunnelSockets || {});
+adminRouter.get("/sockets", adminAuthMiddleware, async (req, res) => {
+  const clusterData = await getClusterState();
   res.status(200).json({
-    total: socketsKeys.length,
-    sockets: socketsKeys.map((host) => {
-      const socket = tunnelSockets[host];
-      return {
-        id: socket.id,
-        host: host,
-        clientId: socket.clientId || null,
-        connected: socket.connected,
-        stats: stats.getHostStats(host),
-      };
-    }),
+    total: clusterData.sockets.length,
+    sockets: clusterData.sockets,
   });
 });
 
@@ -297,12 +545,17 @@ adminRouter.delete("/sockets/:host", adminAuthMiddleware, (req, res) => {
   const host = req.params.host;
   const s = tunnelSockets[host];
   if (s) {
+    try {
+      s.emit("disconnect_exit", "Disconnected by administrator");
+    } catch {}
     delete tunnelSockets[host];
     stats.deleteStats(host);
+    unregisterClientTunnel(s.clientId, host);
     s.disconnect(true);
   }
   if (process.send) {
     process.send({ type: "UNREGISTER_HOST", host: host });
+    process.send({ type: "DISCONNECT_SOCKET_CLUSTER", host: host });
   }
   res.status(200).json({
     host: host,
@@ -310,9 +563,101 @@ adminRouter.delete("/sockets/:host", adminAuthMiddleware, (req, res) => {
   });
 });
 
+adminRouter.get("/clients", adminAuthMiddleware, async (req, res) => {
+  const clusterData = await getClusterState();
+  if (clusterData.clients && clusterData.clients.length) {
+    return res.status(200).json({
+      total: clusterData.clients.length,
+      clients: clusterData.clients,
+    });
+  }
+
+  // Fallback / Single-process: aggregate from clientRegistry
+  const clientsList = [];
+  for (const [cId, cData] of clientRegistry.entries()) {
+    const activeHosts = Array.from(cData.activeHosts || []);
+    let totalRequests = 0;
+    activeHosts.forEach((h) => {
+      const hs = stats.getHostStats(h);
+      if (hs && hs.requests) totalRequests += hs.requests;
+    });
+    clientsList.push({
+      clientId: cId,
+      activeTunnelsCount: activeHosts.length,
+      totalTunnelsCreated: cData.totalTunnelsCreated || activeHosts.length,
+      activeHosts,
+      totalRequests,
+      firstSeen: cData.firstSeen,
+      lastSeen: cData.lastSeen,
+      status: activeHosts.length > 0 ? "online" : "offline",
+    });
+  }
+
+  // Ensure active tunnel sockets without an entry are also surfaced
+  Object.keys(tunnelSockets || {}).forEach((h) => {
+    const s = tunnelSockets[h];
+    const cId = s.clientId || "anonymous";
+    if (!clientRegistry.has(cId)) {
+      const hs = stats.getHostStats(h);
+      clientsList.push({
+        clientId: cId,
+        activeTunnelsCount: 1,
+        totalTunnelsCreated: 1,
+        activeHosts: [h],
+        totalRequests: hs?.requests || 0,
+        firstSeen: Date.now(),
+        lastSeen: Date.now(),
+        status: "online",
+      });
+    }
+  });
+
+  res.status(200).json({
+    total: clientsList.length,
+    clients: clientsList,
+  });
+});
+
+adminRouter.delete("/clients/:clientId", adminAuthMiddleware, (req, res) => {
+  const clientId = req.params.clientId;
+  let disconnectedCount = 0;
+
+  Object.keys(tunnelSockets || {}).forEach((host) => {
+    const s = tunnelSockets[host];
+    const cId = s.clientId || "anonymous";
+    if (cId === clientId) {
+      try {
+        s.emit("disconnect_exit", "Client disconnected by administrator");
+      } catch {}
+      delete tunnelSockets[host];
+      stats.deleteStats(host);
+      unregisterClientTunnel(s.clientId, host);
+      s.disconnect(true);
+      disconnectedCount++;
+      if (process.send) {
+        process.send({ type: "UNREGISTER_HOST", host });
+      }
+    }
+  });
+
+  if (process.send) {
+    process.send({ type: "DISCONNECT_CLIENT_CLUSTER", clientId });
+  }
+
+  res.status(200).json({
+    clientId,
+    status: "DISCONNECTED",
+    disconnectedCount,
+  });
+});
+
 adminRouter.get("/stats", adminAuthMiddleware, async (req, res) => {
-  const globalStats = await stats.getGlobalStats();
-  res.status(200).json(globalStats);
+  const clusterData = await getClusterState();
+  const baseStats = await stats.getGlobalStats();
+  const combinedStats = (clusterData.stats && !redisConfig?.enabled)
+    ? { ...baseStats, ...clusterData.stats }
+    : baseStats;
+  res.status(200).json(combinedStats);
 });
 
 adminRouter.post("/tokens/generate", adminAuthMiddleware, (req, res) => {
@@ -335,6 +680,28 @@ adminRouter.post("/tokens/generate", adminAuthMiddleware, (req, res) => {
 });
 
 app.use("/admin/api", adminRouter);
+
+// Serve Web UI Console
+const path = require("path");
+const fs = require("fs");
+const candidateWebPaths = [
+  path.join(__dirname, "../web/dist"),
+  path.join(__dirname, "./web/dist"),
+  path.join(__dirname, "public"),
+];
+const webDistPath = candidateWebPaths.find((p) => fs.existsSync(p));
+if (webDistPath) {
+  app.use("/admin", express.static(webDistPath));
+  app.get("/admin", (req, res) => {
+    res.redirect(301, "/admin/");
+  });
+  app.use("/admin", (req, res, next) => {
+    if (req.method === "GET") {
+      return res.sendFile(path.join(webDistPath, "index.html"));
+    }
+    next();
+  });
+}
 //////////////////// E Admin Console API ////////////////////
 
 //////////////////// S HTTP Tunnel Client Router ////////////////////
@@ -346,11 +713,19 @@ function getReqHeaders(req) {
   );
 
   const headers = { ...req.headers };
-  const url = new URL(`${encrypted ? "https" : "http"}://${req.headers.host}`);
+  const rawHost = req.headers.host || `localhost:${appConfig.port || 3000}`;
+  let port = encrypted ? 443 : 80;
+
+  try {
+    const url = new URL(`${encrypted ? "https" : "http"}://${rawHost}`);
+    if (url.port) {
+      port = url.port;
+    }
+  } catch {}
 
   const forwardValues = {
-    for: req.connection.remoteAddress || req.socket.remoteAddress,
-    port: url.port || (encrypted ? 443 : 80),
+    for: req.connection?.remoteAddress || req.socket?.remoteAddress || "127.0.0.1",
+    port: port,
     proto: encrypted ? "https" : "http",
   };
 
@@ -368,14 +743,15 @@ function getReqHeaders(req) {
 }
 
 app.use("/", (req, res) => {
-  const host = req.headers.host;
-  const tunnelSocket = tunnelSockets[host];
+  const host = req.headers.host || "";
+  const tunnelSocket = findTunnelSocket(req);
 
   if (!tunnelSocket) {
     res.sendStatus(404);
     return;
   }
 
+  const hostKey = tunnelSocket.connectHost || host;
   const requestId = uuidV4();
   const tunnelRequest = new TunnelRequest({
     socket: tunnelSocket,
@@ -410,7 +786,10 @@ app.use("/", (req, res) => {
   };
 
   const onResponse = ({ statusCode, statusMessage, headers }) => {
-    stats.recordHttp(host);
+    stats.recordHttp(hostKey);
+    if (process.send) {
+      process.send({ type: "RECORD_HTTP", host: hostKey });
+    }
     tunnelResponse.off("requestError", onRequestError);
     if (!res.headersSent) {
       res.writeHead(statusCode, statusMessage, headers);
@@ -457,8 +836,8 @@ httpServer.on("upgrade", (req, socket, head) => {
   }
   logger.info(`WS ${req.url}`);
 
-  const host = req.headers.host;
-  const tunnelSocket = tunnelSockets[host];
+  const host = req.headers.host || "";
+  const tunnelSocket = findTunnelSocket(req);
 
   if (!tunnelSocket) {
     socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
@@ -466,6 +845,7 @@ httpServer.on("upgrade", (req, socket, head) => {
     return;
   }
 
+  const hostKey = tunnelSocket.connectHost || host;
   const requestId = uuidV4();
   const tunnelRequest = new TunnelRequest({
     socket: tunnelSocket,
@@ -495,6 +875,9 @@ httpServer.on("upgrade", (req, socket, head) => {
 
   const onResponse = ({ statusCode, statusMessage, headers, httpVersion }) => {
     stats.recordWs(host);
+    if (process.send) {
+      process.send({ type: "RECORD_WS", host });
+    }
     tunnelResponse.off("requestError", onRequestError);
 
     if (statusCode && statusCode !== 101) {

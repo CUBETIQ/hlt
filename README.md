@@ -131,6 +131,23 @@ main().catch(console.error);
 
 ---
 
+## Web Admin Console
+
+HLT includes a modern, high-performance Web Admin Console embedded directly with the server, built using **React 19**, **Tailwind CSS v4**, **shadcn UI**, **TanStack Query** (for background state polling & cache invalidation), and **TanStack Table** (for interactive data tables).
+
+### Features
+- **Live Cluster Overview**: Real-time KPI summary (active tunnels, routed requests, total sessions, uptime) and V8 memory heap/CPU gauges.
+- **Active Tunnels Management**: Searchable and sortable table of all connected client sockets with per-host request counts and one-click disconnect actions.
+- **Client Token Generator**: Admin workspace to issue cryptographically signed JWT credentials with customizable expiration periods and one-click copyable CLI / SDK commands.
+- **Privacy-Preserving Telemetry**: Aggregate monotonic counters and traffic distribution tracking with zero retention of user payloads, headers, or tokens.
+
+### Accessing the Web Console
+- **Production URL**: `http://localhost:3000/admin` (or your configured server domain)
+- **Local Development**: Run `cd web && bun install && bun run dev` to launch the Vite dev server with instant HMR and API proxy on `http://localhost:5173`.
+- **Default Credentials**: Configured via `ADMIN_USERNAME` (default `admin`) and `ADMIN_PASSWORD` (default `admin123`).
+
+---
+
 ## Production Deployment Guide
 
 ### Deployment via Docker Compose
@@ -298,15 +315,6 @@ server {
 
 ---
 
-## Continuous Integration & Workflows
-
-Automated GitHub Actions workflows in `.github/workflows/`:
-1. **`ci.yml`**: Runs `bun test` and type/syntax checks on both server and client on every pull request.
-2. **`server-docker.yml`**: Builds multi-arch (`linux/amd64`, `linux/arm64`) Docker images with Buildx and publishes to GitHub Container Registry (`ghcr.io`).
-3. **`client-publish.yml`**: Compiles the standalone client bundles and publishes to the NPM registry on release tags.
-
----
-
 ## License
 
-ISC License. Copyright (c) 2026 CUBETIQ Solution.
+ISC License. Copyright (c) 2026 Cubis.

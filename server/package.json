@@ -6,7 +6,8 @@
   "scripts": {
     "start": "bun cluster.js",
     "server": "bun server.js",
-    "test": "bun test"
+    "test": "bun test",
+    "build:web": "cd ../web && bun run build"
   },
   "repository": {
     "type": "git",

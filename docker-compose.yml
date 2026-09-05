@@ -1,8 +1,8 @@
 services:
   hlt-server:
     build:
-      context: ./server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: server/Dockerfile
     image: cubetiq/hlt-server:latest
     container_name: hlt-server
     restart: unless-stopped

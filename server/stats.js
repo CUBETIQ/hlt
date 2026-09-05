@@ -106,35 +106,80 @@ class TelemetryManager {
       try {
         const redisGlobal = await this.redisClient.hGetAll("hlt:stats:global");
         const activeHosts = await this.redisClient.sMembers("hlt:stats:active_hosts");
+        const totalConn = parseInt(redisGlobal.total_connections, 10) || 0;
+        const totalDisc = parseInt(redisGlobal.total_disconnections, 10) || 0;
+        const totalHttp = parseInt(redisGlobal.total_http_requests, 10) || 0;
+        const totalWs = parseInt(redisGlobal.total_ws_requests, 10) || 0;
+        const activeSockets = parseInt(redisGlobal.active_sockets, 10) || 0;
         return {
-          total_connections: parseInt(redisGlobal.total_connections, 10) || 0,
-          total_disconnections: parseInt(redisGlobal.total_disconnections, 10) || 0,
-          total_http_requests: parseInt(redisGlobal.total_http_requests, 10) || 0,
-          total_ws_requests: parseInt(redisGlobal.total_ws_requests, 10) || 0,
-          active_sockets: parseInt(redisGlobal.active_sockets, 10) || 0,
+          total_connections: totalConn,
+          total_disconnections: totalDisc,
+          total_http_requests: totalHttp,
+          total_ws_requests: totalWs,
+          active_sockets: activeSockets,
           active_hosts_count: activeHosts.length,
+          totalConnections: totalConn,
+          totalDisconnections: totalDisc,
+          totalHttpRequests: totalHttp,
+          totalWsRequests: totalWs,
+          totalRequests: totalHttp + totalWs,
+          activeSockets: activeSockets,
+          activeHostsCount: activeHosts.length,
           uptime: process.uptime(),
           storage: "redis",
         };
       } catch (err) {}
     }
 
+    const g = this.memoryStats.global;
+    const totalHttp = g.total_http_requests || 0;
+    const totalWs = g.total_ws_requests || 0;
+    const totalConn = g.total_connections || 0;
+    const totalDisc = g.total_disconnections || 0;
+    const activeSockets = g.active_sockets || 0;
+
+    const hostStatsObj = {};
+    for (const [h, v] of this.memoryStats.hosts.entries()) {
+      hostStatsObj[h] = {
+        requests: (v.http_count || 0) + (v.ws_count || 0),
+        http_count: v.http_count || 0,
+        ws_count: v.ws_count || 0,
+        connected_at: v.connected_at,
+      };
+    }
+
     return {
-      ...this.memoryStats.global,
+      ...g,
+      totalConnections: totalConn,
+      totalDisconnections: totalDisc,
+      totalHttpRequests: totalHttp,
+      totalWsRequests: totalWs,
+      totalRequests: totalHttp + totalWs,
+      activeSockets: activeSockets,
       active_hosts_count: this.memoryStats.hosts.size,
+      activeHostsCount: this.memoryStats.hosts.size,
+      hostStats: hostStatsObj,
       uptime: process.uptime(),
       storage: "memory",
     };
   }
 
   getHostStats(host) {
-    return (
-      this.memoryStats.hosts.get(host) || {
+    const entry = this.memoryStats.hosts.get(host);
+    if (!entry) {
+      return {
+        requests: 0,
         http_count: 0,
         ws_count: 0,
         connected_at: null,
-      }
-    );
+      };
+    }
+    return {
+      requests: (entry.http_count || 0) + (entry.ws_count || 0),
+      http_count: entry.http_count || 0,
+      ws_count: entry.ws_count || 0,
+      connected_at: entry.connected_at,
+    };
   }
 
   // Backward-compatible helper aliases

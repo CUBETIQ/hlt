@@ -1,2 +1,11 @@
 .DS_Store
 *.sock
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.env
+.env.local
+.env.*.local
+*.log
+
