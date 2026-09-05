@@ -120,7 +120,7 @@ function getSocketAliases(socket) {
   return Array.from(aliases).filter(Boolean);
 }
 
-function findTunnelSocket(req) {
+function findTunnelSocket(req, { allowLocalFallback = true } = {}) {
   const hostHeader = (req.headers && req.headers.host) || "";
   const host = hostHeader.trim();
   const hostWithoutPort = host.split(":")[0];
@@ -196,7 +196,7 @@ function findTunnelSocket(req) {
   // When testing locally (request sent to localhost or 127.0.0.1) and exactly 1 tunnel is connected,
   // route to that tunnel so developers don't need custom local DNS entries!
   const isLocalRequest = hostWithoutPort === "localhost" || hostWithoutPort === "127.0.0.1";
-  if (isLocalRequest && activePrimaryHosts.size === 1) {
+  if (allowLocalFallback && isLocalRequest && activePrimaryHosts.size === 1) {
     const onlyHost = Array.from(activePrimaryHosts)[0];
     if (onlyHost && tunnelSockets[onlyHost]) {
       return tunnelSockets[onlyHost];
@@ -260,9 +260,14 @@ io.use((socket, next) => {
 
     const existsSocket = tunnelSockets[connectHost];
     if (existsSocket && existsSocket.connected) {
+      // Only the client that owns the host may take it over. Without this any
+      // authenticated client could evict another tenant's tunnel by connecting
+      // to its host with keep_connection.
+      const sameOwner =
+        (existsSocket.clientId || null) === (decoded.clientId || null);
       if (
         existsSocket.id === socket.id ||
-        socket.handshake.auth?.keep_connection === true
+        (sameOwner && socket.handshake.auth?.keep_connection === true)
       ) {
         existsSocket.emit(
           "disconnect_exit",
@@ -354,8 +359,11 @@ io.on("connection", (socket) => {
   socket.once("disconnect", onDisconnect);
 });
 
-// Middleware
-app.use(morgan("common"));
+// Middleware — per-request logging is a measurable cost on the hot tunnel path,
+// so it is opt-in (REQUEST_LOG=true).
+if (appConfig.request_log) {
+  app.use(morgan("common"));
+}
 
 // Basic Health & Info Endpoints
 app.get("/_/health", (req, res) => {
@@ -368,6 +376,18 @@ app.get("/_/info", (req, res) => {
     uptime: process.uptime(),
     build: buildInfo,
   });
+});
+
+// Control plane gate: anything that resolves to a tunnel is forwarded straight
+// to the tunnel client, so `/admin`, `/api/*` etc. on a tunnel host belong to
+// the user's app, not to this server. (`/_/*` above stays reserved.)
+// The localhost single-tunnel fallback is deliberately excluded here: on the
+// server's own host the admin console must win over that convenience route.
+app.use((req, res, next) => {
+  if (findTunnelSocket(req, { allowLocalFallback: false })) {
+    return handleTunnelRequest(req, res);
+  }
+  next();
 });
 
 //////////////////// S Unified Token & Client API ////////////////////
@@ -416,17 +436,47 @@ app.use("/__free__/api", apiRouter);
 const adminRouter = express.Router();
 adminRouter.use(bodyParser.json());
 
+// Constant-time compare that does not leak length via an early return.
+const crypto = require("crypto");
+const safeEqual = (a, b) => {
+  const ha = crypto.createHash("sha256").update(String(a)).digest();
+  const hb = crypto.createHash("sha256").update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+};
+
+// Simple per-IP throttle on admin login (in-memory, per worker).
+const LOGIN_MAX_ATTEMPTS = 10;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const loginAttempts = new Map();
+
 // Admin Login (Issues Admin JWT Token)
 adminRouter.post("/auth/login", (req, res) => {
   const { username, password } = req.body || {};
+  const ip = req.ip || req.socket?.remoteAddress || "unknown";
+  const now = Date.now();
+
+  const entry = loginAttempts.get(ip);
+  if (entry && now - entry.first > LOGIN_WINDOW_MS) {
+    loginAttempts.delete(ip);
+  } else if (entry && entry.count >= LOGIN_MAX_ATTEMPTS) {
+    return res.status(429).json({ error: "Too many failed attempts, try again later" });
+  }
+
+  const fail = () => {
+    const cur = loginAttempts.get(ip) || { count: 0, first: now };
+    cur.count++;
+    loginAttempts.set(ip, cur);
+    return res.status(401).json({ error: "Invalid admin credentials" });
+  };
 
   if (!username || !password) {
     return res.status(400).json({ error: "Username and password are required" });
   }
 
-  if (username !== adminConfig.username || password !== adminConfig.password) {
-    return res.status(401).json({ error: "Invalid admin credentials" });
+  if (!safeEqual(username, adminConfig.username) || !safeEqual(password, adminConfig.password)) {
+    return fail();
   }
+  loginAttempts.delete(ip);
 
   const adminToken = jwt.sign(
     { role: "admin", username },
@@ -762,11 +812,14 @@ function escapeHtml(str) {
     .replace(/'/g, "&#039;");
 }
 
-app.use("/", (req, res) => {
+function handleTunnelRequest(req, res) {
   const host = req.headers.host || "";
   const tunnelSocket = findTunnelSocket(req);
 
   if (!tunnelSocket) {
+    // Close the connection so a keep-alive socket pinned to this worker is
+    // re-dialled (and re-routed) on the next request instead of staying stuck.
+    res.set("Connection", "close");
     res.status(404);
     if (req.accepts("html")) {
       res.type("html").send(`<!DOCTYPE html>
@@ -915,7 +968,9 @@ app.use("/", (req, res) => {
       cleanup(new Error("Response closed prematurely"));
     }
   });
-});
+}
+
+app.use("/", handleTunnelRequest);
 
 function createSocketHttpHeader(line, headers) {
   return (
@@ -974,6 +1029,12 @@ httpServer.on("upgrade", (req, socket, head) => {
     },
   });
 
+  // An upgrade request carries no body. Close it immediately so the client
+  // flushes the local request; without this the local request is never sent
+  // and the upgrade hangs until timeout. Post-101 traffic flows over
+  // tunnelResponse (duplex), not tunnelRequest.
+  tunnelRequest.end();
+
   const tunnelResponse = new TunnelResponse({
     socket: tunnelSocket,
     responseId: requestId,
@@ -991,9 +1052,9 @@ httpServer.on("upgrade", (req, socket, head) => {
   };
 
   const onResponse = ({ statusCode, statusMessage, headers, httpVersion }) => {
-    stats.recordWs(host);
+    stats.recordWs(hostKey);
     if (process.send) {
-      process.send({ type: "RECORD_WS", host });
+      process.send({ type: "RECORD_WS", host: hostKey });
     }
     tunnelResponse.off("requestError", onRequestError);
 
@@ -1008,9 +1069,14 @@ httpServer.on("upgrade", (req, socket, head) => {
       return;
     }
 
+    // Node lower-cases incoming headers; adding capitalised keys here would
+    // emit a *duplicate* Upgrade/Connection header and clients reject that
+    // ("Invalid Upgrade header"). Only fill them in when actually missing.
     const responseHeaders = { ...(headers || {}) };
-    responseHeaders["Upgrade"] = responseHeaders["upgrade"] || "websocket";
-    responseHeaders["Connection"] = responseHeaders["connection"] || "Upgrade";
+    const hasHeader = (name) =>
+      Object.keys(responseHeaders).some((k) => k.toLowerCase() === name);
+    if (!hasHeader("upgrade")) responseHeaders["Upgrade"] = "websocket";
+    if (!hasHeader("connection")) responseHeaders["Connection"] = "Upgrade";
 
     socket.write(
       createSocketHttpHeader("HTTP/1.1 101 Switching Protocols", responseHeaders),
@@ -1035,6 +1101,10 @@ httpServer.on("upgrade", (req, socket, head) => {
 
 if (process.env.IS_CLUSTER_WORKER === "true") {
   process.on("message", (msg, socket) => {
+    if (msg && msg.type === "SHUTDOWN") {
+      gracefulShutdown("SHUTDOWN");
+      return;
+    }
     if (msg && msg.type === "STICKY_SOCKET" && socket) {
       if (msg.head) {
         const headBuf = Buffer.isBuffer(msg.head)

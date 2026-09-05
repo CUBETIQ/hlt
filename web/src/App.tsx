@@ -125,10 +125,10 @@ export function App() {
               </TabsTrigger>
             </TabsList>
 
-            <div className="text-[11px] font-mono text-muted-foreground hidden sm:flex items-center gap-1.5">
+            {/*<div className="text-[11px] font-mono text-muted-foreground hidden sm:flex items-center gap-1.5">
               <span className="size-1.5 rounded-full bg-emerald-500 inline-block" />
               <span>Cluster Engine</span>
-            </div>
+            </div>*/}
           </div>
 
           <TabsContent value="overview">

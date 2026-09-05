@@ -239,3 +239,32 @@ describe("Tunnel Host Aliases & Resolver", () => {
 
 
 
+
+describe("Host-Sticky Worker Routing", () => {
+  const { hostSlot } = require("../util");
+
+  test("maps a host to the same worker slot on every reconnect", () => {
+    const host = "client1-.tunnel.example.com";
+    const first = hostSlot(host, 4);
+    for (let i = 0; i < 100; i++) {
+      expect(hostSlot(host, 4)).toBe(first);
+    }
+    expect(first).toBeGreaterThanOrEqual(0);
+    expect(first).toBeLessThan(4);
+  });
+
+  test("spreads distinct hosts across slots", () => {
+    const used = new Set();
+    for (let i = 0; i < 200; i++) {
+      used.add(hostSlot(`client${i}-.tunnel.example.com`, 4));
+    }
+    expect(used.size).toBe(4);
+  });
+
+  test("stays in range for edge inputs", () => {
+    expect(hostSlot("", 4)).toBe(hostSlot(undefined, 4));
+    expect(hostSlot("", 4)).toBeLessThan(4);
+    expect(hostSlot("anything", 1)).toBe(0);
+    expect(hostSlot("anything", 0)).toBe(0);
+  });
+});

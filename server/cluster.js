@@ -3,6 +3,7 @@ const cluster = require("cluster");
 const os = require("os");
 const net = require("net");
 const { AppConfig } = require("./config");
+const { hostSlot } = require("./util");
 const logger = require("./logger");
 
 const isClusterEnabled = () => {
@@ -36,8 +37,19 @@ if (cluster.isPrimary || cluster.isMaster) {
 
     const hostToWorker = new Map();
     const workerHosts = new Map();
+    // Fixed slots: a respawned worker takes the same slot, so hostToSlot stays stable.
+    const slots = new Array(numWorkers).fill(null);
     const workers = [];
-    let workerIndex = 0;
+
+    // Deterministic host -> worker slot. This is what makes routing truly
+    // "host-sticky": a tunnel client reconnecting for the same host always lands
+    // on the same worker, so keep-alive browser connections pinned to that worker
+    // keep resolving after a client restart.
+    const workerForHost = (key) => {
+      const preferred = slots[hostSlot(key, slots.length)];
+      if (preferred && preferred.isConnected()) return preferred;
+      return slots.find((w) => w && w.isConnected()) || null;
+    };
 
     const clusterSockets = new Map();
     const clusterClients = new Map();
@@ -49,19 +61,13 @@ if (cluster.isPrimary || cluster.isMaster) {
       hostStats: new Map(),
     };
 
-    const getNextWorker = () => {
-      if (workers.length === 0) return null;
-      const worker = workers[workerIndex % workers.length];
-      workerIndex++;
-      return worker;
-    };
-
-    const forkWorker = (index) => {
+    const forkWorker = (slot) => {
       const worker = cluster.fork({
-        WORKER_ID: index,
+        WORKER_ID: slot,
         IS_CLUSTER_WORKER: "true",
       });
       workers.push(worker);
+      slots[slot] = worker;
       workerHosts.set(worker, new Set());
 
       worker.on("message", (msg) => {
@@ -146,6 +152,7 @@ if (cluster.isPrimary || cluster.isMaster) {
             }
             workerHosts.get(worker)?.delete(msg.host);
             clusterSockets.delete(msg.host);
+            clusterStats.hostStats.delete(msg.host);
             clusterStats.total_disconnections++;
 
             for (const c of clusterClients.values()) {
@@ -255,20 +262,17 @@ if (cluster.isPrimary || cluster.isMaster) {
       });
 
       worker.on("exit", (code, signal) => {
-        logger.warn(
-          `[HLT Cluster] Worker ${worker.process.pid} exited (code: ${code}, signal: ${signal}). Respawning...`
-        );
-
-        // Remove from workers array
         const idx = workers.indexOf(worker);
         if (idx !== -1) workers.splice(idx, 1);
 
-        // Clean up registered hosts for dead worker
+        // Clean up registered hosts for dead worker (only those it still owns)
         const hosts = workerHosts.get(worker);
         if (hosts) {
           for (const host of hosts) {
+            if (hostToWorker.get(host) !== worker) continue;
             hostToWorker.delete(host);
             clusterSockets.delete(host);
+            clusterStats.hostStats.delete(host);
             for (const c of clusterClients.values()) {
               if (c.activeHosts.has(host)) {
                 c.activeHosts.delete(host);
@@ -276,113 +280,132 @@ if (cluster.isPrimary || cluster.isMaster) {
               }
             }
             const hostWithoutPort = host.split(":")[0];
-            if (hostWithoutPort !== host) {
+            if (hostWithoutPort !== host && hostToWorker.get(hostWithoutPort) === worker) {
               hostToWorker.delete(hostWithoutPort);
             }
           }
           workerHosts.delete(worker);
         }
 
-        // Auto-heal: fork replacement worker
-        forkWorker(index);
+        if (slots[slot] === worker) slots[slot] = null;
+        if (isShuttingDown) return;
+
+        logger.warn(
+          `[HLT Cluster] Worker ${worker.process.pid} exited (code: ${code}, signal: ${signal}). Respawning slot ${slot}...`
+        );
+        forkWorker(slot);
       });
 
       return worker;
     };
 
+    let isShuttingDown = false;
     for (let i = 0; i < numWorkers; i++) {
-      forkWorker(i + 1);
+      forkWorker(i);
     }
 
     // Host-Sticky TCP Connection Router
-    const primaryServer = net.createServer({ pauseOnConnect: true }, (socket) => {
-      let isDataHandled = false;
+    const MAX_HEADER_PEEK = 64 * 1024;
 
-      const onData = (chunk) => {
-        isDataHandled = true;
-        socket.pause();
+    const resolveWorker = (head) => {
+      const str = head.toString("latin1");
+      const hostMatch = str.match(/(?:^|\r?\n)host:\s*([^\r\n]+)/i);
+      const host = hostMatch ? hostMatch[1].trim() : "";
+      const hostWithoutPort = host.split(":")[0];
 
-        const str = chunk.toString("latin1");
-        const hostMatch = str.match(/(?:^|\r?\n)host:\s*([^\r\n]+)/i);
-        const host = hostMatch ? hostMatch[1].trim() : null;
-        const hostWithoutPort = host ? host.split(":")[0] : null;
+      // Tunnel client handshake: hash-only, so the same tunnel host always maps
+      // to the same worker across client restarts.
+      if (str.indexOf("/$cubetiq_http_tunnel") !== -1) {
+        return workerForHost(host);
+      }
 
-        const isTunnelPath =
-          str.indexOf(" /$cubetiq_http_tunnel") !== -1 ||
-          str.indexOf("/$cubetiq_http_tunnel") !== -1;
+      if (host && hostToWorker.has(host)) return hostToWorker.get(host);
+      if (hostWithoutPort && hostToWorker.has(hostWithoutPort)) {
+        return hostToWorker.get(hostWithoutPort);
+      }
 
-        let targetWorker = null;
-        if (isTunnelPath) {
-          // Tunnel client websocket handshake: route round-robin to a worker
-          targetWorker = getNextWorker();
-        } else if (host && hostToWorker.has(host)) {
-          targetWorker = hostToWorker.get(host);
-        } else if (hostWithoutPort && hostToWorker.has(hostWithoutPort)) {
-          targetWorker = hostToWorker.get(hostWithoutPort);
-        } else {
-          // Check subdomain prefix (e.g. "client1" from "client1.localhost:3000")
-          const sub = hostWithoutPort ? hostWithoutPort.split(".")[0] : null;
-          if (sub && hostToWorker.has(sub)) {
-            targetWorker = hostToWorker.get(sub);
-          } else if (sub && hostToWorker.has(`${sub}-`)) {
-            targetWorker = hostToWorker.get(`${sub}-`);
-          } else if (sub) {
-            // Find any registered alias starting with or matching sub
-            for (const [registeredKey, worker] of hostToWorker.entries()) {
-              if (
-                registeredKey === sub ||
-                registeredKey.startsWith(`${sub}-`) ||
-                sub.startsWith(`${registeredKey}-`) ||
-                sub.startsWith(registeredKey)
-              ) {
-                targetWorker = worker;
-                break;
-              }
-            }
-          }
-
-          if (!targetWorker) {
-            if (
-              (hostWithoutPort === "localhost" || hostWithoutPort === "127.0.0.1") &&
-              clusterSockets.size === 1
-            ) {
-              // Local single-tunnel fallback: forward directly to the worker holding the only tunnel
-              const onlyHost = Array.from(clusterSockets.keys())[0];
-              targetWorker = hostToWorker.get(onlyHost) || getNextWorker();
-            } else {
-              // Default or unmatched request (e.g. /_/health, admin, 404)
-              targetWorker = getNextWorker();
-            }
+      // Subdomain prefix (e.g. "client1" from "client1.example.com")
+      const sub = hostWithoutPort ? hostWithoutPort.split(".")[0] : null;
+      if (sub) {
+        if (hostToWorker.has(sub)) return hostToWorker.get(sub);
+        if (hostToWorker.has(`${sub}-`)) return hostToWorker.get(`${sub}-`);
+        for (const [registeredKey, worker] of hostToWorker.entries()) {
+          if (
+            registeredKey === sub ||
+            registeredKey.startsWith(`${sub}-`) ||
+            sub.startsWith(`${registeredKey}-`)
+          ) {
+            return worker;
           }
         }
+      }
 
+      // Local single-tunnel fallback for developers without custom DNS
+      if (
+        (hostWithoutPort === "localhost" || hostWithoutPort === "127.0.0.1") &&
+        clusterSockets.size === 1
+      ) {
+        const onlyHost = Array.from(clusterSockets.keys())[0];
+        return hostToWorker.get(onlyHost) || workerForHost(host);
+      }
+
+      // Unmatched (health, admin, 404): still deterministic per host.
+      return workerForHost(host);
+    };
+
+    const primaryServer = net.createServer({ pauseOnConnect: true }, (socket) => {
+      let head = null;
+
+      const onData = (chunk) => {
+        head = head ? Buffer.concat([head, chunk]) : chunk;
+        const str = head.toString("latin1");
+
+        // The Host header may not be in the first TCP segment. Keep peeking
+        // until we have the full request head (or hit the cap) before routing.
+        if (
+          str.indexOf("\r\n\r\n") === -1 &&
+          !/(?:^|\r?\n)host:\s*[^\r\n]+\r?\n/i.test(str) &&
+          head.length < MAX_HEADER_PEEK
+        ) {
+          socket.once("data", onData);
+          return;
+        }
+
+        socket.pause();
+        socket.setTimeout(0);
+        const targetWorker = resolveWorker(head);
         if (targetWorker && targetWorker.isConnected()) {
-          targetWorker.send({ type: "STICKY_SOCKET", head: chunk }, socket);
+          targetWorker.send({ type: "STICKY_SOCKET", head }, socket);
         } else {
           socket.destroy();
         }
       };
 
       socket.once("data", onData);
-
-      socket.once("error", (err) => {
-        if (!isDataHandled) {
-          socket.destroy();
-        }
+      socket.once("error", () => socket.destroy());
+      socket.setTimeout(30000, () => {
+        if (!head) socket.destroy();
       });
-
       socket.resume();
     });
 
     const port = AppConfig.app.port;
+    primaryServer.on("error", (err) => {
+      logger.error(`[HLT Cluster] Primary TCP router failed: ${err.message}`);
+      isShuttingDown = true;
+      for (const w of workers) w.kill("SIGKILL");
+      process.exit(1);
+    });
     primaryServer.listen(port, () => {
       logger.info(
-        `[HLT Cluster] Primary TCP router listening on port ${port}`
+        `[HLT Cluster] Primary TCP router listening on port ${port} (${numWorkers} host-sticky workers)`
       );
     });
 
     // Graceful shutdown handling
     const shutdown = (sig) => {
+      if (isShuttingDown) return;
+      isShuttingDown = true;
       logger.info(`[HLT Cluster] Received ${sig}, shutting down workers...`);
       primaryServer.close();
       for (const w of workers) {
@@ -390,12 +413,16 @@ if (cluster.isPrimary || cluster.isMaster) {
           w.send({ type: "SHUTDOWN" });
         }
       }
-      setTimeout(() => {
-        for (const w of workers) {
-          w.kill("SIGKILL");
+      const timer = setInterval(() => {
+        if (workers.length === 0) {
+          clearInterval(timer);
+          process.exit(0);
         }
+      }, 200);
+      setTimeout(() => {
+        for (const w of workers) w.kill("SIGKILL");
         process.exit(0);
-      }, 5000);
+      }, 10000).unref?.();
     };
 
     process.on("SIGTERM", () => shutdown("SIGTERM"));
