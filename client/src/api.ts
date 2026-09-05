@@ -8,12 +8,19 @@ import { TunnelRequest, TunnelResponse } from "./lib";
 import { addPrefixOnHttpSchema, generateUUID } from "./util";
 
 import { PROFILE_DEFAULT, PROFILE_PATH, SERVER_DEFAULT_URL } from "./constant";
-import { ClientOptions, Options } from "./interface";
-import { getToken } from './sdk';
+import { ClientOptions, Options, TunnelConfig, TunnelGrant } from "./interface";
+import { getToken, getTunnelConfig } from './sdk';
 
 export interface Client {
     getEndpoint(): string | null;
+    getEndpoints(): string[];
     stop(): void;
+}
+
+/** Mirror of the server's hostname layout: <name>.domain or <name>-domain. */
+function buildTunnelUrl(config: TunnelConfig, name: string): string {
+    const sep = config.format === "prefix" ? "-" : ".";
+    return `${config.scheme}://${name}${sep}${config.domain}`;
 }
 
 function formatBytes(bytes: number): string {
@@ -38,6 +45,8 @@ export class HttpTunnelClient implements Client {
     private keepAliveTimer: NodeJS.Timeout | null = null;
     private keepAliveTimeout: number | null = null;
     private endpoint: string | null = null;
+    private endpoints: string[] = [];
+    private tunnelConfig: TunnelConfig | null = null;
 
     private keepAlive() {
         if (!this.socket) {
@@ -124,11 +133,25 @@ export class HttpTunnelClient implements Client {
 
     // Start Client
     public initStartClient = async (options: Options) => {
-        // Please change this if your domain goes wrong here
-        // Current style using sub-domain: https://{{clientId}}-tunnel.myhostingdomain.com
-        // (Original server: https://tunnel.myhostingdomain.com)
         const profile = options.profile || PROFILE_DEFAULT;
         const clientId = `${options.apiKey || options.clientId || generateUUID()}`;
+        const server = options.server || SERVER_DEFAULT_URL;
+
+        // The public name defaults to the client id, so a client always keeps
+        // its own reserved subdomain unless it asks for something else.
+        const baseName =
+            profile === PROFILE_DEFAULT ? clientId : `${clientId}-${profile}`;
+        const defaultName = options.suffix ? `${baseName}-${options.suffix}` : baseName;
+        const requestedNames = (options.names && options.names.length
+            ? options.names
+            : [defaultName]
+        ).map((n) => n.toLowerCase().trim()).filter(Boolean);
+
+        // Ask the server how it addresses tunnels. Older servers answer null and
+        // we fall back to the legacy client-side host construction.
+        const tunnelConfig = await getTunnelConfig(server);
+        this.tunnelConfig = tunnelConfig;
+
         const clientIdSub =
             profile === PROFILE_DEFAULT ? `${clientId}-` : `${clientId}-${profile}-`;
         const clientEndpoint = (
@@ -136,8 +159,12 @@ export class HttpTunnelClient implements Client {
         )
             .toLowerCase()
             .trim();
-        const serverUrl = addPrefixOnHttpSchema(options.server || SERVER_DEFAULT_URL, clientEndpoint);
-        this.endpoint = serverUrl
+
+        const serverUrl = tunnelConfig
+            ? buildTunnelUrl(tunnelConfig, requestedNames[0])
+            : addPrefixOnHttpSchema(server, clientEndpoint);
+        this.endpoint = serverUrl;
+        this.endpoints = [serverUrl];
 
         // extra options for socket to identify the client (authentication and options of tunnel)
         const defaultParams = {
@@ -147,6 +174,7 @@ export class HttpTunnelClient implements Client {
             clientIdSub: clientIdSub,
             clientEndpoint: clientEndpoint,
             serverUrl: serverUrl,
+            hostnames: requestedNames,
             keep_connection: options.keep_connection || true,
         };
 
@@ -184,13 +212,24 @@ export class HttpTunnelClient implements Client {
         this.socket = io(serverUrl, initParams);
 
         const clientLogPrefix = `client: ${clientId} on profile: ${profile}`;
+        const targetHost = options.host || "localhost";
+
         this.socket.on("connect", () => {
             if (this.socket!.connected) {
                 console.log(`\x1b[32m✔ ${clientLogPrefix} is connected to server successfully!\x1b[0m`);
-                const targetHost = options.host || "localhost";
-                const targetPort = options.port;
-                console.log(`\x1b[36m➜ Forwarding:\x1b[0m ${this.endpoint} -> http://${targetHost}:${targetPort}`);
             }
+        });
+
+        // The server is the authority on which public URLs this client holds;
+        // it may grant more than one.
+        this.socket.on("tunnel_grant", (grant: TunnelGrant) => {
+            if (grant?.urls?.length) {
+                this.endpoints = grant.urls;
+                this.endpoint = grant.urls[0];
+            }
+            this.endpoints.forEach((url) => {
+                console.log(`\x1b[36m➜ Forwarding:\x1b[0m ${url} -> http://${targetHost}:${options.port}`);
+            });
         });
 
         this.socket.on("connect_error", (e) => {
@@ -523,6 +562,11 @@ export class HttpTunnelClient implements Client {
 
     public getEndpoint = () => {
         return this.endpoint;
+    }
+
+    /** All public URLs granted by the server for this tunnel. */
+    public getEndpoints = () => {
+        return this.endpoints;
     }
 }
 

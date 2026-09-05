@@ -1,7 +1,7 @@
 import axios, { AxiosResponse } from "axios";
 import { HttpTunnelClient } from "./api";
 import { SERVER_DEFAULT_URL } from "./constant";
-import { Options } from "./interface";
+import { Options, TunnelConfig } from "./interface";
 import { generateUUID } from "./util";
 
 export interface TokenPayload {
@@ -44,6 +44,23 @@ export async function getToken(
 // Backward compatibility alias
 export const getTokenFree = getToken;
 
+/**
+ * Read the server's public addressing scheme so the client can build the host
+ * it should dial. Returns null on older servers that do not expose it.
+ */
+export async function getTunnelConfig(
+  baseUrl: string = SERVER_DEFAULT_URL
+): Promise<TunnelConfig | null> {
+  try {
+    const url = `${baseUrl.replace(/\/+$/, "")}/api/config`;
+    const resp = await axios.get(url, { timeout: 5000 });
+    const tunnel = resp.data?.tunnel;
+    return tunnel && tunnel.enabled ? tunnel : null;
+  } catch {
+    return null;
+  }
+}
+
 export interface HltClientConfig {
   server?: string;
   apiKey?: string;
@@ -59,10 +76,13 @@ export interface ConnectOptions {
   suffix?: string;
   origin?: string;
   keep_connection?: boolean;
+  /** Public tunnel names to reserve. Defaults to the client id. */
+  names?: string[];
 }
 
 export interface TunnelInstance {
   endpoint: string | null;
+  endpoints: string[];
   stop(): void;
   client: HttpTunnelClient;
 }
@@ -122,6 +142,7 @@ export class HltClient {
       host: options.host || "localhost",
       suffix: options.suffix,
       origin: options.origin,
+      names: options.names,
       keep_connection: options.keep_connection ?? true,
       exitOnError: false,
     };
@@ -130,7 +151,14 @@ export class HltClient {
     this.activeClients.push(tunnelClient);
 
     return {
-      endpoint: tunnelClient.getEndpoint(),
+      // Getters: the server's grant lands just after connect, so a snapshot
+      // taken here would miss the extra URLs.
+      get endpoint() {
+        return tunnelClient.getEndpoint();
+      },
+      get endpoints() {
+        return tunnelClient.getEndpoints();
+      },
       stop: () => {
         tunnelClient.stop();
         this.activeClients = this.activeClients.filter((c) => c !== tunnelClient);

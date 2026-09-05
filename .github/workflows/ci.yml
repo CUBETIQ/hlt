@@ -10,6 +10,7 @@ jobs:
   test-server:
     name: Test Server
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -27,11 +28,17 @@ jobs:
         working-directory: ./server
         run: |
           bun run test
-          bun -e "require('./server.js')" --dry-run 2>/dev/null || true
+          # Parse-only. Never `require` these: server.js/cluster.js bind a port
+          # on load and the job would hang forever.
+          node --check server.js
+          node --check cluster.js
+          node --check lib.js
+          node --check hostnames.js
 
   test-client:
     name: Build & Test Client
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v7

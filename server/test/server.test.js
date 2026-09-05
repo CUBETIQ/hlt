@@ -268,3 +268,67 @@ describe("Host-Sticky Worker Routing", () => {
     expect(hostSlot("anything", 0)).toBe(0);
   });
 });
+
+describe("Tunnel Hostname Claims", () => {
+  const { ClaimRegistry, normalizeName, validateName } = require("../hostnames");
+
+  test("normalizes client-style names with trailing separators", () => {
+    expect(normalizeName("Acme-")).toBe("acme");
+    expect(normalizeName("  ACME.  ")).toBe("acme");
+    expect(normalizeName("acme-api")).toBe("acme-api");
+  });
+
+  test("rejects reserved and malformed names", () => {
+    expect(validateName("acme")).toBeNull();
+    expect(validateName("admin")).toContain("reserved");
+    expect(validateName("Bad_Name")).toContain("lowercase");
+    expect(validateName("a".repeat(64))).toContain("63");
+    expect(validateName("")).toBeTruthy();
+  });
+
+  test("locks a name to its owning client", () => {
+    const reg = new ClaimRegistry(60000);
+    expect(reg.claim(["acme"], "client-a", "sock-1").ok).toBe(true);
+
+    const stolen = reg.claim(["acme"], "client-b", "sock-2");
+    expect(stolen.ok).toBe(false);
+    expect(stolen.error).toContain("already taken");
+
+    // Owner reconnecting on a new socket keeps it
+    expect(reg.claim(["acme"], "client-a", "sock-3").ok).toBe(true);
+  });
+
+  test("keeps the reservation while the owner is offline, then frees it", () => {
+    const reg = new ClaimRegistry(60000);
+    reg.claim(["acme"], "client-a", "sock-1");
+    reg.release(["acme"], "sock-1");
+
+    // Still reserved inside the TTL
+    expect(reg.claim(["acme"], "client-b", "sock-2").ok).toBe(false);
+    expect(reg.claim(["acme"], "client-a", "sock-3").ok).toBe(true);
+
+    // Expired reservations are claimable by anyone
+    const expiring = new ClaimRegistry(-1);
+    expiring.claim(["acme"], "client-a", "sock-1");
+    expiring.release(["acme"], "sock-1");
+    expect(expiring.claim(["acme"], "client-b", "sock-2").ok).toBe(true);
+  });
+
+  test("claims all names or none", () => {
+    const reg = new ClaimRegistry(60000);
+    reg.claim(["taken"], "client-a", "sock-1");
+
+    const result = reg.claim(["mine", "taken"], "client-b", "sock-2");
+    expect(result.ok).toBe(false);
+    // "mine" must not have been half-claimed by the failed attempt
+    expect(reg.owner("mine")).toBeNull();
+  });
+
+  test("a stale release does not free a name the owner just re-claimed", () => {
+    const reg = new ClaimRegistry(60000);
+    reg.claim(["acme"], "client-a", "sock-1");
+    reg.claim(["acme"], "client-a", "sock-2"); // reconnect
+    reg.release(["acme"], "sock-1"); // late disconnect of the old socket
+    expect(reg.owner("acme").socketId).toBe("sock-2");
+  });
+});

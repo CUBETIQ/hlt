@@ -37,6 +37,25 @@ const AppConfig = {
     jwt_secret: requireSecret("ADMIN_JWT_SECRET", "hlt_admin_jwt_secret"),
     jwt_expires_in: process.env.ADMIN_JWT_EXPIRES_IN || "24h",
   },
+  // Public tunnel URLs. Two layouts, selected by TUNNEL_FORMAT:
+  //   subdomain: TUNNEL_DOMAIN=example.com    -> <name>.example.com
+  //   prefix:    TUNNEL_DOMAIN=lt.example.com -> <name>-lt.example.com
+  // Leaving TUNNEL_DOMAIN unset keeps the legacy behaviour: whatever host the
+  // client connected to becomes its tunnel host.
+  tunnel: {
+    domain: process.env.TUNNEL_DOMAIN || null,
+    format: process.env.TUNNEL_FORMAT === "prefix" ? "prefix" : "subdomain",
+    scheme: process.env.TUNNEL_SCHEME || "https",
+    reserved: (process.env.TUNNEL_RESERVED || "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+    max_per_client: parseInt(process.env.TUNNEL_MAX_PER_CLIENT, 10) || 5,
+    // How long a name stays reserved for its owner after it disconnects.
+    // 0 releases it immediately.
+    claim_ttl_ms:
+      (parseInt(process.env.TUNNEL_CLAIM_TTL_HOURS, 10) || 24) * 60 * 60 * 1000,
+  },
   redis: {
     enabled: process.env.REDIS_ENABLED === "true" || process.env.REDIS_ENABLED === true,
     url: process.env.REDIS_URL || "redis://localhost:6379",

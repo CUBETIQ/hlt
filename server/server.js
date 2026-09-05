@@ -19,6 +19,7 @@ const { AppConfig } = require("./config");
 const buildInfo = require("./build_info.js");
 const stats = require("./stats");
 const logger = require("./logger");
+const hostnames = require("./hostnames");
 
 const hostId = `${require("os").hostname()}#${process.pid}`;
 const appConfig = AppConfig.app;
@@ -206,6 +207,81 @@ function findTunnelSocket(req, { allowLocalFallback = true } = {}) {
   return null;
 }
 
+//////////////////// S Public tunnel hostname allocation ////////////////////
+const tunnelConfig = AppConfig.tunnel;
+
+// Under clustering the primary owns the registry (one authority for the whole
+// cluster); a single process owns its own.
+const localClaims = process.send ? null : new hostnames.ClaimRegistry();
+
+// Ask for names, all-or-nothing. Resolves { ok, names } | { ok: false, error }.
+function claimNames(names, clientId, socketId) {
+  if (localClaims) {
+    return Promise.resolve(localClaims.claim(names, clientId, socketId));
+  }
+  return clusterRequest(
+    { type: "CLAIM_HOSTS", names, clientId, socketId },
+    { ok: false, error: "claim registry unavailable" }
+  );
+}
+
+function releaseNames(names, socketId) {
+  if (!names || names.length === 0) return;
+  if (localClaims) {
+    localClaims.release(names, socketId);
+  } else {
+    try {
+      process.send({ type: "RELEASE_HOSTS", names, socketId });
+    } catch {}
+  }
+}
+
+/**
+ * Work out which public names a connecting client gets.
+ * Requested names come from the handshake; the host it dialled is always
+ * included so the connection's own address stays addressable. Falls back to the
+ * client id, which is what makes `<clientId>.example.com` the default URL.
+ */
+function resolveRequestedNames(socket, clientId) {
+  const connectHost = socket.handshake.headers.host || "";
+  const auth = socket.handshake.auth || {};
+  const raw = auth.hostnames || auth.hostname || auth.names || [];
+  const requested = (Array.isArray(raw) ? raw : String(raw).split(","))
+    .map((s) => String(s).trim())
+    .filter(Boolean);
+
+  // No tunnel domain configured: legacy mode, the dialled host *is* the tunnel
+  // and gets locked to this client as-is.
+  if (!hostnames.isEnabled()) {
+    return { names: [connectHost.toLowerCase()], hosts: [connectHost], urls: [] };
+  }
+
+  const names = [];
+  const add = (value) => {
+    const name = hostnames.normalizeName(value);
+    if (name && !names.includes(name)) names.push(name);
+  };
+
+  add(hostnames.parseName(connectHost));
+  requested.forEach(add);
+  if (names.length === 0) add(clientId);
+
+  if (names.length > tunnelConfig.max_per_client) {
+    return { error: `at most ${tunnelConfig.max_per_client} names per client` };
+  }
+  for (const name of names) {
+    const invalid = hostnames.validateName(name);
+    if (invalid) return { error: invalid };
+  }
+
+  return {
+    names,
+    hosts: names.map((n) => hostnames.buildHost(n)),
+    urls: names.map((n) => hostnames.buildUrl(n)),
+  };
+}
+//////////////////// E Public tunnel hostname allocation ////////////////////
+
 // Client tracking registry
 const clientRegistry = new Map();
 
@@ -284,13 +360,45 @@ io.use((socket, next) => {
       return next(new Error(`[403] Socket has an existing active connection for ${connectHost}`));
     }
 
-    next();
+    // Reserve the public names for this client before the connection is
+    // accepted, so two clients can never both believe they own a URL.
+    const resolved = resolveRequestedNames(socket, decoded.clientId);
+    if (resolved.error) {
+      return next(new Error(`[409-HOSTNAME] ${resolved.error}`));
+    }
+
+    claimNames(resolved.names, decoded.clientId || null, socket.id)
+      .then((result) => {
+        if (!result || !result.ok) {
+          return next(
+            new Error(`[409-HOSTNAME] ${(result && result.error) || "name unavailable"}`)
+          );
+        }
+        socket.grantedNames = result.names;
+        socket.grantedHosts = hostnames.isEnabled()
+          ? result.names.map((n) => hostnames.buildHost(n))
+          : resolved.hosts;
+        socket.grantedUrls = hostnames.isEnabled()
+          ? result.names.map((n) => hostnames.buildUrl(n))
+          : [];
+        next();
+      })
+      .catch((e) => next(new Error(`[500-HOSTNAME] ${e.message || e}`)));
   });
 });
 
 io.on("connection", (socket) => {
   const connectHost = socket.handshake.headers.host;
-  const aliases = getSocketAliases(socket);
+  const grantedHosts = socket.grantedHosts || [];
+  // Granted public hosts route exactly like the dialled host: same socket, same
+  // worker (they are registered with the primary as aliases of connectHost).
+  const aliases = Array.from(
+    new Set([
+      ...getSocketAliases(socket),
+      ...grantedHosts,
+      ...grantedHosts.map((h) => h.split(":")[0]),
+    ])
+  );
 
   tunnelSockets[connectHost] = socket;
   activePrimaryHosts.add(connectHost);
@@ -314,6 +422,17 @@ io.on("connection", (socket) => {
       clientId: socket.clientId || null,
     });
   }
+
+  // Hand the client its public URLs. Emitted after registration so the URLs are
+  // live the moment the client prints them.
+  // In legacy mode `urls` is empty on purpose: the server does not know the
+  // client's scheme there, so the client keeps the URL it built itself.
+  socket.emit("tunnel_grant", {
+    clientId: socket.clientId || null,
+    names: socket.grantedNames || [],
+    hosts: grantedHosts.length ? grantedHosts : [connectHost],
+    urls: socket.grantedUrls || [],
+  });
 
   // Record privacy-first connection telemetry
   stats.recordConnect(connectHost);
@@ -351,6 +470,9 @@ io.on("connection", (socket) => {
         socketId: socket.id,
       });
     }
+
+    // Names stay reserved for this client until the claim TTL expires.
+    releaseNames(socket.grantedNames, socket.id);
 
     socket.off("message", onMessage);
   };
@@ -422,6 +544,21 @@ const handleTokenGeneration = (req, res) => {
     timestamp: Date.now(),
   });
 };
+
+// Public addressing scheme, so a client can build its own tunnel host without
+// guessing. No secrets here by design.
+apiRouter.get("/config", (req, res) => {
+  res.status(200).json({
+    tunnel: {
+      enabled: hostnames.isEnabled(),
+      domain: tunnelConfig.domain,
+      format: tunnelConfig.format,
+      scheme: tunnelConfig.scheme,
+      maxPerClient: tunnelConfig.max_per_client,
+      example: hostnames.buildHost("<name>"),
+    },
+  });
+});
 
 apiRouter.post("/token", handleTokenGeneration);
 // Alias for SDK backward compatibility
@@ -512,7 +649,7 @@ const pendingClusterRequests = new Map();
 if (process.on) {
   process.on("message", (msg) => {
     if (!msg || typeof msg !== "object") return;
-    if (msg.type === "CLUSTER_STATE_RES" && msg.reqId) {
+    if (msg.reqId && typeof msg.type === "string" && msg.type.endsWith("_RES")) {
       const cb = pendingClusterRequests.get(msg.reqId);
       if (cb) {
         pendingClusterRequests.delete(msg.reqId);
@@ -533,6 +670,36 @@ if (process.on) {
   });
 }
 
+/**
+ * Round-trip a request to the cluster primary. Resolves `fallback` if there is
+ * no primary or it does not answer in time, so a wedged primary degrades
+ * instead of hanging the handshake.
+ */
+function clusterRequest(msg, fallback, timeout = 2000) {
+  if (!process.send) return Promise.resolve(fallback);
+
+  return new Promise((resolve) => {
+    const reqId = uuidV4();
+    const timer = setTimeout(() => {
+      pendingClusterRequests.delete(reqId);
+      resolve(fallback);
+    }, timeout);
+
+    pendingClusterRequests.set(reqId, (res) => {
+      clearTimeout(timer);
+      resolve(res);
+    });
+
+    try {
+      process.send({ ...msg, reqId });
+    } catch {
+      clearTimeout(timer);
+      pendingClusterRequests.delete(reqId);
+      resolve(fallback);
+    }
+  });
+}
+
 function getClusterState(timeout = 1000) {
   const localSockets = Object.keys(tunnelSockets || {}).map((host) => {
     const socket = tunnelSockets[host];
@@ -545,34 +712,8 @@ function getClusterState(timeout = 1000) {
     };
   });
 
-  if (!process.send) {
-    return Promise.resolve({
-      sockets: localSockets,
-      clients: null,
-      stats: null,
-    });
-  }
-
-  return new Promise((resolve) => {
-    const reqId = uuidV4();
-    const timer = setTimeout(() => {
-      pendingClusterRequests.delete(reqId);
-      resolve({ sockets: localSockets, clients: null, stats: null });
-    }, timeout);
-
-    pendingClusterRequests.set(reqId, (res) => {
-      clearTimeout(timer);
-      resolve(res);
-    });
-
-    try {
-      process.send({ type: "GET_CLUSTER_STATE", reqId });
-    } catch {
-      clearTimeout(timer);
-      pendingClusterRequests.delete(reqId);
-      resolve({ sockets: localSockets, clients: null, stats: null });
-    }
-  });
+  const fallback = { sockets: localSockets, clients: null, stats: null };
+  return clusterRequest({ type: "GET_CLUSTER_STATE" }, fallback, timeout);
 }
 
 // Admin Management Endpoints

@@ -4,6 +4,7 @@ const os = require("os");
 const net = require("net");
 const { AppConfig } = require("./config");
 const { hostSlot } = require("./util");
+const { ClaimRegistry } = require("./hostnames");
 const logger = require("./logger");
 
 const isClusterEnabled = () => {
@@ -50,6 +51,11 @@ if (cluster.isPrimary || cluster.isMaster) {
       if (preferred && preferred.isConnected()) return preferred;
       return slots.find((w) => w && w.isConnected()) || null;
     };
+
+    // The primary is the single authority for public tunnel names: workers ask
+    // it over IPC so two workers can never grant the same name.
+    const claims = new ClaimRegistry();
+    const workerClaims = new Map(); // worker -> Set(name), so a crash frees them
 
     const clusterSockets = new Map();
     const clusterClients = new Map();
@@ -170,6 +176,18 @@ if (cluster.isPrimary || cluster.isMaster) {
               `[HLT Cluster] Ignored stale unregister for host '${msg.host}' from worker ${worker.process.pid} (replaced by socket ${currentEntry?.id})`
             );
           }
+        } else if (msg.type === "CLAIM_HOSTS" && msg.reqId) {
+          const result = claims.claim(msg.names || [], msg.clientId || null, msg.socketId);
+          if (result.ok) {
+            const held = workerClaims.get(worker) || new Set();
+            result.names.forEach((n) => held.add(n));
+            workerClaims.set(worker, held);
+          }
+          worker.send({ type: "CLAIM_HOSTS_RES", reqId: msg.reqId, ...result });
+        } else if (msg.type === "RELEASE_HOSTS") {
+          claims.release(msg.names || [], msg.socketId);
+          const held = workerClaims.get(worker);
+          if (held) (msg.names || []).forEach((n) => held.delete(n));
         } else if (msg.type === "RECORD_HTTP" && msg.host) {
           clusterStats.total_http_requests++;
           const hs = clusterStats.hostStats.get(msg.host);
@@ -285,6 +303,14 @@ if (cluster.isPrimary || cluster.isMaster) {
             }
           }
           workerHosts.delete(worker);
+        }
+
+        // A crashed worker cannot send RELEASE_HOSTS; free its names here or
+        // they stay pinned to a socket that no longer exists.
+        const held = workerClaims.get(worker);
+        if (held) {
+          claims.release(Array.from(held));
+          workerClaims.delete(worker);
         }
 
         if (slots[slot] === worker) slots[slot] = null;

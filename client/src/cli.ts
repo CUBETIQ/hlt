@@ -69,11 +69,20 @@ program
   .option("-p, --profile <string>", "profile name", PROFILE_DEFAULT)
   .option("-h, --host <string>", "local host value", "localhost")
   .option("-o, --origin <string>", "change request origin")
+  .option(
+    "-n, --name <names>",
+    "comma separated public tunnel names to reserve (default: client id)"
+  )
   .action((portOrAddress, options) => {
     startClient({
       port: portOrAddress,
       address: portOrAddress,
-      options,
+      options: {
+        ...options,
+        names: options.name
+          ? String(options.name).split(",").map((s: string) => s.trim()).filter(Boolean)
+          : undefined,
+      },
     })
   });
 
