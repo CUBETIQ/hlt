@@ -30,19 +30,19 @@
   "author": "Sambo Chea <sombochea@cubis.tech>",
   "license": "ISC",
   "dependencies": {
-    "axios": "^1.7.9",
-    "commander": "^12.1.0",
-    "express": "^4.21.2",
-    "http-proxy-middleware": "^2.0.7",
-    "https-proxy-agent": "^7.0.6",
-    "socket.io-client": "^4.8.1"
+    "axios": "^1.20.0",
+    "commander": "^15.0.0",
+    "express": "^5.2.1",
+    "http-proxy-middleware": "^4.2.0",
+    "https-proxy-agent": "^9.1.0",
+    "socket.io-client": "^4.8.3"
   },
   "publishConfig": {
     "access": "public"
   },
   "devDependencies": {
-    "@types/express": "^4.17.21",
-    "@types/node": "^22.13.10",
-    "typescript": "^5.7.3"
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.4.1",
+    "typescript": "^7.0.2"
   }
 }
