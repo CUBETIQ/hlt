@@ -100,6 +100,33 @@ describe("TelemetryManager", () => {
     expect(flushes).toHaveLength(1);
   });
 
+  test("re-queues a batch when the store rejects it", async () => {
+    const telemetry = new TelemetryManager(10);
+    const flushes = [];
+    telemetry.on("flush", (batch) => flushes.push(batch));
+    // A Redis that accepts the pipeline but fails on exec.
+    telemetry.setRedisClient({
+      isOpen: true,
+      multi: () => ({
+        hIncrBy() { return this; },
+        hSet() { return this; },
+        exec: () => Promise.reject(new Error("The client is offline")),
+      }),
+    });
+
+    telemetry.recordHttp("a.example.com", "acme");
+    telemetry.recordTraffic("a.example.com", "acme", 10, 20);
+
+    // The rejected deltas go back into the buffer and are flushed again rather
+    // than being lost for the length of the outage.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(flushes.length).toBeGreaterThan(1);
+    const expected = { http: 1, ws: 0, in: 10, out: 20 };
+    expect(flushes[0].hosts.get("a.example.com")).toEqual(expected);
+    expect(flushes[flushes.length - 1].hosts.get("a.example.com")).toEqual(expected);
+    expect(flushes[flushes.length - 1].clients.get("acme")).toEqual(expected);
+  });
+
   test("keeps per-client traffic history after the tunnel disconnects", async () => {
     const telemetry = new TelemetryManager(10);
 

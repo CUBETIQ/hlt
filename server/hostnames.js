@@ -201,7 +201,13 @@ class RedisClaimRegistry {
         await this.redis.persist(key);
         granted.push(name);
       } catch (err) {
-        return { ok: false, error: `claim store unavailable: ${err.message}` };
+        // `unavailable` tells the caller this is an outage, not a refusal, so it
+        // can fall back to the local registry instead of rejecting the client.
+        return {
+          ok: false,
+          unavailable: true,
+          error: `claim store unavailable: ${err.message || err.code || err}`,
+        };
       }
     }
 

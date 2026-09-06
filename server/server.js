@@ -61,31 +61,68 @@ io.engine.on("connection_error", (err) => {
 let redisClaims = null;
 const redisConfig = AppConfig.redis;
 if (redisConfig && redisConfig.enabled && redisConfig.url) {
+  // Never log credentials that may be embedded in the URL.
+  const safeUrl = redisConfig.url.replace(/\/\/[^@/]*@/, "//***@");
+
   const pubClient = createClient({
     url: redisConfig.url,
     username: redisConfig.username,
     password: redisConfig.password,
     database: redisConfig.database || 0,
+    // Fail commands immediately while disconnected instead of queueing them.
+    // Queued commands do not reject, they hang — which stalled the tunnel
+    // handshake (and the admin API) for the whole length of an outage instead
+    // of falling back to local state.
+    disableOfflineQueue: true,
+    socket: {
+      // Retry for as long as the process lives. Redis/Valkey coming up after the
+      // server (or restarting under it) must not disable it permanently — which
+      // is what a one-shot connect did.
+      reconnectStrategy: (retries) => Math.min(200 * (retries + 1), 5000),
+    },
   });
   const subClient = pubClient.duplicate();
 
-  pubClient.on("error", (err) =>
-    logger.error("[Redis pubClient] error:", err.message),
-  );
-  subClient.on("error", (err) =>
-    logger.error("[Redis subClient] error:", err.message),
-  );
+  // One line per outage instead of one per retry, plus a line when it recovers.
+  let redisDown = false;
+  let lastErrorLoggedAt = 0;
+  const onRedisError = (label) => (err) => {
+    const now = Date.now();
+    redisDown = true;
+    if (now - lastErrorLoggedAt < 30000) return;
+    lastErrorLoggedAt = now;
+    logger.error(`[Redis ${label}] ${safeUrl} unavailable:`, err);
+  };
+  pubClient.on("error", onRedisError("pub"));
+  subClient.on("error", onRedisError("sub"));
 
-  Promise.all([pubClient.connect(), subClient.connect()]).then(() => {
-    logger.info(`Redis adapter and telemetry connected: ${redisConfig.url}`);
+  let wired = false;
+  const onReady = () => {
+    if (!pubClient.isOpen || !subClient.isOpen) return;
+    if (wired) {
+      if (redisDown) {
+        redisDown = false;
+        lastErrorLoggedAt = 0;
+        logger.info(`Redis reconnected: ${safeUrl}`);
+      }
+      return;
+    }
+    wired = true;
+    redisDown = false;
     io.adapter(createAdapter(pubClient, subClient));
     stats.setRedisClient(pubClient);
     // With Redis available, tunnel-name ownership moves out of process memory so
     // a client keeps its URL across a restart or a move to another node.
     redisClaims = new hostnames.RedisClaimRegistry(pubClient);
-  }).catch((err) => {
-    logger.error("Failed to connect to Redis:", err.message);
-  });
+    logger.info(`Redis adapter, telemetry and name claims connected: ${safeUrl}`);
+  };
+  pubClient.on("ready", onReady);
+  subClient.on("ready", onReady);
+
+  // Kick both connections off; the reconnect strategy owns everything after
+  // this, so a rejection here is not terminal.
+  pubClient.connect().catch(() => {});
+  subClient.connect().catch(() => {});
 }
 
 // Cluster stats aggregation: one batched IPC message per flush window instead of
@@ -246,13 +283,7 @@ const tunnelConfig = AppConfig.tunnel;
 const localClaims = process.send ? null : new hostnames.ClaimRegistry();
 
 // Ask for names, all-or-nothing. Resolves { ok, names } | { ok: false, error }.
-function claimNames(names, clientId, socketId) {
-  // Redis first: it is the only authority that spans nodes and restarts.
-  if (redisClaims) {
-    return redisClaims
-      .claim(names, clientId, socketId)
-      .catch((e) => ({ ok: false, error: e.message || String(e) }));
-  }
+function claimLocally(names, clientId, socketId) {
   if (localClaims) {
     return Promise.resolve(localClaims.claim(names, clientId, socketId));
   }
@@ -260,6 +291,35 @@ function claimNames(names, clientId, socketId) {
     { type: "CLAIM_HOSTS", names, clientId, socketId },
     { ok: false, error: "claim registry unavailable" }
   );
+}
+
+const CLAIM_TIMEOUT_MS = 2000;
+
+function claimNames(names, clientId, socketId) {
+  // Redis first: it is the only authority that spans nodes and restarts.
+  if (redisClaims) {
+    // A Redis that is connected but not answering would otherwise hold the
+    // handshake open; cap it and treat a timeout as an outage.
+    const timeout = new Promise((resolve) =>
+      setTimeout(
+        () => resolve({ ok: false, unavailable: true, error: "claim store timed out" }),
+        CLAIM_TIMEOUT_MS
+      ).unref?.()
+    );
+    return Promise.race([redisClaims.claim(names, clientId, socketId), timeout])
+      .catch((e) => ({ ok: false, unavailable: true, error: e.message || String(e) }))
+      .then((result) => {
+        if (result && result.unavailable) {
+          // Redis is down: keep accepting tunnels on this node's own registry
+          // rather than refusing every connection. Cross-node uniqueness is not
+          // guaranteed while it lasts, which beats a total outage.
+          logger.warn(`[Claims] ${result.error} — falling back to local registry`);
+          return claimLocally(names, clientId, socketId);
+        }
+        return result;
+      });
+  }
+  return claimLocally(names, clientId, socketId);
 }
 
 function releaseNames(names, socketId) {

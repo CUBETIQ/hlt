@@ -13,6 +13,8 @@ const { EventEmitter } = require("events");
  */
 const FLUSH_MS = parseInt(process.env.STATS_FLUSH_MS, 10) || 1000;
 const NODE_KEY_PREFIX = "hlt:stats:node:";
+// Cap on how much unflushed telemetry is kept while Redis is unreachable.
+const REQUEUE_LIMIT = parseInt(process.env.STATS_REQUEUE_LIMIT, 10) || 5000;
 const NODE_TTL_MS = parseInt(process.env.STATS_NODE_TTL_MS, 10) || 30000;
 // Per-host counters are live-tunnel data (client history is the durable record),
 // so they are refreshed while the tunnel is up and expire once it is gone.
@@ -189,10 +191,34 @@ class TelemetryManager extends EventEmitter {
         if (d.out) multi.hIncrBy(key, "bytes_out", d.out);
         multi.hSet(key, "last_seen", String(Date.now()));
       }
-      multi.exec().catch(() => {});
+      multi.exec().catch(() => this._requeue(pending));
     } catch {
       // Telemetry is best-effort and must never break the tunnel path.
+      this._requeue(pending);
     }
+  }
+
+  /**
+   * Put a failed batch back so a Redis blip costs no counters. Bounded on
+   * purpose: during a long outage the newest window wins rather than the buffer
+   * growing without limit.
+   */
+  _requeue(pending) {
+    if (this._pending.hosts.size + this._pending.clients.size > REQUEUE_LIMIT) return;
+    for (const field of ["http", "ws", "in", "out"]) {
+      this._pending[field] += pending[field];
+    }
+    for (const [host, delta] of pending.hosts) {
+      for (const field of ["http", "ws", "in", "out"]) {
+        this._bumpMap(this._pending.hosts, host, field, delta[field]);
+      }
+    }
+    for (const [clientId, delta] of pending.clients) {
+      for (const field of ["http", "ws", "in", "out"]) {
+        this._bumpMap(this._pending.clients, clientId, field, delta[field]);
+      }
+    }
+    this._schedule();
   }
 
   _bumpMap(map, key, field, count) {

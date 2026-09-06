@@ -277,7 +277,7 @@ export function TokensTab() {
               <code className="font-mono">-q</code> quiet logs (live stats stay) ·{" "}
               <code className="font-mono">--log-level debug</code> ·{" "}
               <code className="font-mono">-H rewrite</code> for Next.js/Vite dev servers ·{" "}
-              <code className="font-mono">-s a,b</code> failover nodes
+              <code className="font-mono">-S a,b</code> failover nodes
             </div>
             <div>
               <span className="font-medium text-foreground">Treat the token as a password.</span>{" "}
