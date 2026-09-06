@@ -878,7 +878,19 @@ adminRouter.get("/sockets", adminAuthMiddleware, async (req, res) => {
   res.status(200).json({ total: sockets.length, sockets });
 });
 
-adminRouter.delete("/sockets/:host", adminAuthMiddleware, (req, res) => {
+/** The claim key a tunnel host maps to, so a purge also frees its public name. */
+function claimNameForHost(host) {
+  if (!host) return null;
+  return hostnames.isEnabled()
+    ? hostnames.parseName(host)
+    : String(host).toLowerCase();
+}
+
+/**
+ * Remove a tunnel: disconnect it if it is live, then erase what is persisted for
+ * it — its counters and its reserved public name.
+ */
+adminRouter.delete("/sockets/:host", adminAuthMiddleware, async (req, res) => {
   const host = req.params.host;
   const s = tunnelSockets[host];
   if (s) {
@@ -893,10 +905,21 @@ adminRouter.delete("/sockets/:host", adminAuthMiddleware, (req, res) => {
   if (process.send) {
     process.send({ type: "UNREGISTER_HOST", host: host });
     process.send({ type: "DISCONNECT_SOCKET_CLUSTER", host: host });
+    process.send({ type: "FORGET_HOST", host: host });
   }
+
+  await stats.forgetHost(host);
+  const name = claimNameForHost(host);
+  if (name) {
+    if (redisClaims) await redisClaims.deleteName(name);
+    else if (localClaims) localClaims.deleteName(name);
+    else process.send && process.send({ type: "FORGET_NAME", name });
+  }
+
   res.status(200).json({
     host: host,
-    status: "DISCONNECTED",
+    status: "REMOVED",
+    releasedName: name || null,
   });
 });
 
@@ -970,9 +993,15 @@ adminRouter.get("/clients", adminAuthMiddleware, async (req, res) => {
   });
 });
 
-adminRouter.delete("/clients/:clientId", adminAuthMiddleware, (req, res) => {
+/**
+ * Remove a client: disconnect whatever it holds, then erase its stored history
+ * and its name claims. Works for an offline client too — that is the point, its
+ * record outlives its tunnels.
+ */
+adminRouter.delete("/clients/:clientId", adminAuthMiddleware, async (req, res) => {
   const clientId = req.params.clientId;
   let disconnectedCount = 0;
+  const purgedHosts = [];
 
   Object.keys(tunnelSockets || {}).forEach((host) => {
     const s = tunnelSockets[host];
@@ -986,20 +1015,30 @@ adminRouter.delete("/clients/:clientId", adminAuthMiddleware, (req, res) => {
       unregisterClientTunnel(cId, host);
       s.disconnect(true);
       disconnectedCount++;
+      purgedHosts.push(host);
       if (process.send) {
         process.send({ type: "UNREGISTER_HOST", host });
       }
     }
   });
 
+  clientRegistry.delete(clientId);
   if (process.send) {
     process.send({ type: "DISCONNECT_CLIENT_CLUSTER", clientId });
+    process.send({ type: "FORGET_CLIENT", clientId });
   }
+
+  await Promise.all(purgedHosts.map((h) => stats.forgetHost(h)));
+  await stats.forgetClient(clientId);
+  let releasedNames = 0;
+  if (redisClaims) releasedNames = await redisClaims.releaseOwner(clientId);
+  else if (localClaims) releasedNames = localClaims.releaseOwner(clientId);
 
   res.status(200).json({
     clientId,
-    status: "DISCONNECTED",
+    status: "REMOVED",
     disconnectedCount,
+    releasedNames,
   });
 });
 

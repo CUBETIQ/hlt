@@ -2,7 +2,7 @@ import { useState, useMemo } from "react"
 import type { ColumnDef } from "@tanstack/react-table"
 import type { SocketItem } from "@/lib/api"
 import { useDisconnectSocket } from "@/lib/queries"
-import { formatBytes } from "@/lib/utils"
+import { formatBytes, formatCompact } from "@/lib/utils"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -35,7 +35,7 @@ export function TunnelsTab({ sockets, loading, onRefresh }: TunnelsTabProps) {
     setActionSuccess(null)
     try {
       await disconnectMutation.mutateAsync(host)
-      setActionSuccess(`Disconnected ${host}`)
+      setActionSuccess(`Removed tunnel ${host}`)
       setConfirmHost(null)
     } catch {
       // handled by mutation error
@@ -116,9 +116,11 @@ export function TunnelsTab({ sockets, loading, onRefresh }: TunnelsTabProps) {
           const count = stats?.requests ?? http + ws
           return (
             <div className="text-right">
-              <div className="font-mono text-xs font-medium">{count.toLocaleString()}</div>
+              <div className="font-mono text-xs font-medium" title={`${count.toLocaleString()} requests`}>
+                {formatCompact(count)}
+              </div>
               <div className="font-mono text-[10px] text-muted-foreground">
-                {http.toLocaleString()} http &bull; {ws.toLocaleString()} ws
+                {formatCompact(http)} http &bull; {formatCompact(ws)} ws
               </div>
             </div>
           )
@@ -140,7 +142,7 @@ export function TunnelsTab({ sockets, loading, onRefresh }: TunnelsTabProps) {
       },
       {
         id: "actions",
-        header: () => <div className="text-right">Action</div>,
+        header: () => <div className="text-right">Remove</div>,
         cell: ({ row }) => {
           const host = row.original.host
           const isConfirming = confirmHost === host
@@ -157,7 +159,7 @@ export function TunnelsTab({ sockets, loading, onRefresh }: TunnelsTabProps) {
                     disabled={isBusy}
                     className="h-6 text-[11px] px-2"
                   >
-                    {isBusy ? "Disconnecting..." : "Confirm"}
+                    {isBusy ? "Removing..." : "Confirm"}
                   </Button>
                   <Button
                     variant="ghost"
@@ -171,13 +173,13 @@ export function TunnelsTab({ sockets, loading, onRefresh }: TunnelsTabProps) {
                 </div>
               ) : (
                 <Button
-                  variant="outline"
-                  size="xs"
+                  variant="ghost"
+                  size="icon-xs"
                   onClick={() => setConfirmHost(host)}
-                  className="h-6 text-[11px] text-muted-foreground hover:text-destructive hover:border-destructive/40"
+                  className="size-6 text-muted-foreground hover:text-destructive"
+                  title="Disconnect and remove this tunnel (frees its public name)"
                 >
-                  <TrashIcon size={11} className="mr-1" />
-                  Disconnect
+                  <TrashIcon size={12} />
                 </Button>
               )}
             </div>

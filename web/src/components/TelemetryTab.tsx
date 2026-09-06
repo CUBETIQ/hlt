@@ -4,7 +4,7 @@ import type { TelemetryStats } from "@/lib/api"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { DataTable } from "@/components/ui/data-table"
-import { formatBytes } from "@/lib/utils"
+import { formatBytes, formatCompact } from "@/lib/utils"
 import {
   ShieldIcon,
   ActivityIcon,
@@ -65,13 +65,13 @@ export function TelemetryTab({ stats }: TelemetryTabProps) {
         accessorKey: "requests",
         header: () => <div className="text-right">Requests</div>,
         cell: ({ row }) => (
-          <div className="text-right">
+          <div className="text-right" title={`${row.original.requests.toLocaleString()} requests`}>
             <div className="font-mono text-xs font-medium">
-              {row.original.requests.toLocaleString()}
+              {formatCompact(row.original.requests)}
             </div>
             <div className="font-mono text-[10px] text-muted-foreground">
-              {row.original.http.toLocaleString()} http &bull;{" "}
-              {row.original.ws.toLocaleString()} ws
+              {formatCompact(row.original.http)} http &bull;{" "}
+              {formatCompact(row.original.ws)} ws
             </div>
           </div>
         ),
@@ -115,7 +115,7 @@ export function TelemetryTab({ stats }: TelemetryTabProps) {
             <div className="space-y-0.5">
               <span className="text-[11px] text-muted-foreground font-medium uppercase">Requests</span>
               <div className="font-heading font-bold text-xl sm:text-2xl text-foreground">
-                {totalRequests.toLocaleString()}
+                {formatCompact(totalRequests)}
               </div>
             </div>
             <div className="size-8 rounded bg-blue-500/10 text-blue-500 flex items-center justify-center border border-blue-500/20 shrink-0">
@@ -129,7 +129,7 @@ export function TelemetryTab({ stats }: TelemetryTabProps) {
             <div className="space-y-0.5">
               <span className="text-[11px] text-muted-foreground font-medium uppercase">Sessions</span>
               <div className="font-heading font-bold text-xl sm:text-2xl text-foreground">
-                {totalConnections.toLocaleString()}
+                {formatCompact(totalConnections)}
               </div>
             </div>
             <div className="size-8 rounded bg-purple-500/10 text-purple-500 flex items-center justify-center border border-purple-500/20 shrink-0">

@@ -1,5 +1,16 @@
 export { cn } from "cn"
 
+const compact = new Intl.NumberFormat(undefined, {
+  notation: "compact",
+  maximumFractionDigits: 1,
+})
+
+/** 1000 -> 1K. Use `toLocaleString()` in a title for the exact value. */
+export function formatCompact(value?: number): string {
+  const n = value || 0
+  return n < 1000 ? String(n) : compact.format(n)
+}
+
 /** Compact byte formatting shared by the traffic columns and KPI cards. */
 export function formatBytes(bytes?: number): string {
   const value = bytes || 0

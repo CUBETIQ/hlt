@@ -2,7 +2,7 @@ import { useState, useMemo } from "react"
 import type { ColumnDef } from "@tanstack/react-table"
 import type { ClientItem } from "@/lib/api"
 import { useDisconnectClient } from "@/lib/queries"
-import { formatBytes } from "@/lib/utils"
+import { formatBytes, formatCompact } from "@/lib/utils"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -48,7 +48,7 @@ export function ClientsTab({ clients, loading, onRefresh }: ClientsTabProps) {
     setActionSuccess(null)
     try {
       await disconnectMutation.mutateAsync(clientId)
-      setActionSuccess(`Disconnected client ${clientId}`)
+      setActionSuccess(`Removed client ${clientId} and its stored history`)
       setConfirmClientId(null)
     } catch {
       // handled by mutation error
@@ -152,12 +152,14 @@ export function ClientsTab({ clients, loading, onRefresh }: ClientsTabProps) {
           const { totalRequests, httpRequests, wsRequests } = row.original
           return (
             <div className="text-right">
-              <div className="font-mono text-xs font-medium">
-                {(totalRequests || 0).toLocaleString()}
+              <div
+                className="font-mono text-xs font-medium"
+                title={`${(totalRequests || 0).toLocaleString()} requests`}
+              >
+                {formatCompact(totalRequests)}
               </div>
               <div className="font-mono text-[10px] text-muted-foreground">
-                {(httpRequests || 0).toLocaleString()} http &bull;{" "}
-                {(wsRequests || 0).toLocaleString()} ws
+                {formatCompact(httpRequests)} http &bull; {formatCompact(wsRequests)} ws
               </div>
             </div>
           )
@@ -188,17 +190,13 @@ export function ClientsTab({ clients, loading, onRefresh }: ClientsTabProps) {
       },
       {
         id: "actions",
-        header: () => <div className="text-right">Action</div>,
+        header: () => <div className="text-right">Remove</div>,
         cell: ({ row }) => {
           const clientId = row.original.clientId
           const isActive = row.original.activeTunnelsCount > 0
           const isConfirming = confirmClientId === clientId
           const isBusy =
             disconnectMutation.isPending && disconnectMutation.variables === clientId
-
-          if (!isActive) {
-            return <div className="text-right text-[11px] text-muted-foreground">-</div>
-          }
 
           return (
             <div className="text-right">
@@ -211,7 +209,7 @@ export function ClientsTab({ clients, loading, onRefresh }: ClientsTabProps) {
                     disabled={isBusy}
                     className="h-6 text-[11px] px-2"
                   >
-                    {isBusy ? "Disconnecting..." : "Confirm"}
+                    {isBusy ? "Removing..." : "Confirm"}
                   </Button>
                   <Button
                     variant="ghost"
@@ -225,13 +223,17 @@ export function ClientsTab({ clients, loading, onRefresh }: ClientsTabProps) {
                 </div>
               ) : (
                 <Button
-                  variant="outline"
-                  size="xs"
+                  variant="ghost"
+                  size="icon-xs"
                   onClick={() => setConfirmClientId(clientId)}
-                  className="h-6 text-[11px] text-muted-foreground hover:text-destructive hover:border-destructive/40"
+                  className="size-6 text-muted-foreground hover:text-destructive"
+                  title={
+                    isActive
+                      ? "Disconnect and erase this client's stored history"
+                      : "Erase this offline client's stored history and reserved names"
+                  }
                 >
-                  <TrashIcon size={11} className="mr-1" />
-                  Disconnect
+                  <TrashIcon size={12} />
                 </Button>
               )}
             </div>

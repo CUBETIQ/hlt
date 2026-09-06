@@ -1,7 +1,7 @@
 import type { StatusResponse, TelemetryStats } from "@/lib/api"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-import { formatBytes } from "@/lib/utils"
+import { formatBytes, formatCompact } from "@/lib/utils"
 import {
   ActivityIcon,
   RadioIcon,
@@ -112,8 +112,11 @@ export function OverviewTab({ status, stats }: OverviewTabProps) {
                 Requests
               </span>
               <div className="flex items-baseline gap-2">
-                <span className="font-heading font-bold text-2xl sm:text-3xl tracking-tight text-foreground">
-                  {totalRequests.toLocaleString()}
+                <span
+                  className="font-heading font-bold text-2xl sm:text-3xl tracking-tight text-foreground"
+                  title={totalRequests.toLocaleString()}
+                >
+                  {formatCompact(totalRequests)}
                 </span>
                 <span className="text-[11px] text-muted-foreground font-mono">routed</span>
               </div>
@@ -132,8 +135,11 @@ export function OverviewTab({ status, stats }: OverviewTabProps) {
                 Sessions
               </span>
               <div className="flex items-baseline gap-2">
-                <span className="font-heading font-bold text-2xl sm:text-3xl tracking-tight text-foreground">
-                  {totalConnections.toLocaleString()}
+                <span
+                  className="font-heading font-bold text-2xl sm:text-3xl tracking-tight text-foreground"
+                  title={totalConnections.toLocaleString()}
+                >
+                  {formatCompact(totalConnections)}
                 </span>
                 <span className="text-[11px] text-muted-foreground font-mono">total</span>
               </div>

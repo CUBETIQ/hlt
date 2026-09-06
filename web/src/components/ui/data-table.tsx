@@ -22,6 +22,15 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Button } from "@/components/ui/button"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+
+const PAGE_SIZES = [10, 25, 50, 100]
 
 interface DataTableProps<TData, TValue> {
   columns: ColumnDef<TData, TValue>[]
@@ -29,6 +38,7 @@ interface DataTableProps<TData, TValue> {
   globalFilter?: string
   onGlobalFilterChange?: (value: string) => void
   emptyMessage?: React.ReactNode
+  pageSize?: number
 }
 
 export function DataTable<TData, TValue>({
@@ -37,6 +47,7 @@ export function DataTable<TData, TValue>({
   globalFilter = "",
   onGlobalFilterChange,
   emptyMessage = "No results found.",
+  pageSize = 10,
 }: DataTableProps<TData, TValue>) {
   const [sorting, setSorting] = React.useState<SortingState>([])
   const [columnFilters, setColumnFilters] = React.useState<ColumnFiltersState>([])
@@ -58,10 +69,15 @@ export function DataTable<TData, TValue>({
     getFilteredRowModel: getFilteredRowModel(),
     initialState: {
       pagination: {
-        pageSize: 10,
+        pageSize,
       },
     },
   })
+
+  const { pageIndex, pageSize: currentPageSize } = table.getState().pagination
+  const filteredRows = table.getFilteredRowModel().rows.length
+  const firstRow = filteredRows === 0 ? 0 : pageIndex * currentPageSize + 1
+  const lastRow = Math.min((pageIndex + 1) * currentPageSize, filteredRows)
 
   return (
     <div className="space-y-3">
@@ -116,31 +132,73 @@ export function DataTable<TData, TValue>({
         </Table>
       </div>
 
-      {/* Pagination Controls */}
-      {table.getPageCount() > 1 && (
-        <div className="flex items-center justify-between px-2 text-xs text-muted-foreground">
-          <div>
-            Page {table.getState().pagination.pageIndex + 1} of{" "}
-            {table.getPageCount()}
+      {/* Pagination */}
+      {filteredRows > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-2 px-1 text-[11px] font-mono text-muted-foreground">
+          <div className="flex items-center gap-2">
+            <span>
+              {firstRow}–{lastRow} of {filteredRows}
+            </span>
+            <Select
+              value={String(currentPageSize)}
+              onValueChange={(val: string | null) =>
+                val && table.setPageSize(Number(val))
+              }
+            >
+              <SelectTrigger className="h-6 w-[74px] px-1.5 text-[11px]">
+                <SelectValue>{() => `${currentPageSize} / page`}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {PAGE_SIZES.map((size) => (
+                  <SelectItem key={size} value={String(size)}>
+                    {size} / page
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
-          <div className="flex items-center space-x-2">
+
+          <div className="flex items-center gap-1.5">
+            <span className="mr-1">
+              Page {pageIndex + 1} of {Math.max(table.getPageCount(), 1)}
+            </span>
+            <Button
+              variant="outline"
+              size="xs"
+              onClick={() => table.setPageIndex(0)}
+              disabled={!table.getCanPreviousPage()}
+              className="h-6 px-2 text-[11px]"
+              title="First page"
+            >
+              «
+            </Button>
             <Button
               variant="outline"
               size="xs"
               onClick={() => table.previousPage()}
               disabled={!table.getCanPreviousPage()}
-              className="h-7 text-xs"
+              className="h-6 px-2 text-[11px]"
             >
-              Previous
+              Prev
             </Button>
             <Button
               variant="outline"
               size="xs"
               onClick={() => table.nextPage()}
               disabled={!table.getCanNextPage()}
-              className="h-7 text-xs"
+              className="h-6 px-2 text-[11px]"
             >
               Next
+            </Button>
+            <Button
+              variant="outline"
+              size="xs"
+              onClick={() => table.setPageIndex(table.getPageCount() - 1)}
+              disabled={!table.getCanNextPage()}
+              className="h-6 px-2 text-[11px]"
+              title="Last page"
+            >
+              »
             </Button>
           </div>
         </div>

@@ -33,7 +33,9 @@ const tunnelOptions = (cmd: Command): Command =>
       "server url, overrides the profile (comma separated for failover nodes)"
     )
     .option("-t, --token <jwt>", "auth token, overrides the profile")
-    .option("-p, --profile <string>", "profile name", PROFILE_DEFAULT)
+    // No default: each command applies its own (start -> "default",
+    // webhook -> "webhook"), and the client falls back to "default" anyway.
+    .option("-p, --profile <string>", `profile name (default: "${PROFILE_DEFAULT}")`)
     .option("-k, --key <string>", "client api key for authentication access")
     .option(
       "-n, --name <names>",
@@ -195,31 +197,23 @@ program
 
 
 // webhook
-program
-  .command("webhook")
-  .description("start a webhook server with specific port")
-  .option("--port <number>", "local server port number", `${randomPort()}`)
-  .option("-p, --profile <string>", "setting profile name for connect with hlt server (webhook with current local port)")
+tunnelOptions(
+  program
+    .command("webhook")
+    .description("start a webhook server with specific port")
+    .option("--port <number>", "local server port number", `${randomPort()}`)
+)
   .action((options) => {
     const port = options.port || randomPort();
     startWebhookServer(port);
 
-    // Check if profile is not set, please set default profile to webhook
-    if (!options?.profile) {
-      options.profile = "webhook"
-      options.autoinit = true;
-      console.log(`Start webhook: ${port} via hlt client with profile: ${options.profile}`);
-      startClient({
-        port,
-        options,
-      })
-    } else {
-      console.log(`Start webhook: ${port} via hlt client with profile: ${options.profile}`);
-      startClient({
-        port,
-        options,
-      })
-    }
+    const profile = options.profile || "webhook";
+    console.log(`Start webhook: ${port} via hlt client with profile: ${profile}`);
+    noticeUpdate(options);
+    startClient({
+      port,
+      options: { ...tunnelArgs(options), profile, autoinit: true },
+    })
   });
 
 // config
@@ -368,8 +362,7 @@ program
   });
 
 // proxy
-program
-  .command("proxy")
+tunnelOptions(program.command("proxy"))
   .description("start a proxy server with specific port")
   .argument("<port>", "local server port number", (value) => {
     const port = parseInt(value, 10);
@@ -420,7 +413,6 @@ program
 
     throw new InvalidArgumentError("Target is not a url or host with port.");
   })
-  .option("-p, --profile <string>", "setting profile name for connect with hlt server (proxy with current local port)")
   .action((port, target, options) => {
     const isTcp = target.indexOf("tcp") === 0;
     if (isTcp) {
@@ -461,14 +453,18 @@ program
   });
 
 
+/** Tunnel the proxy only when the caller supplied credentials to tunnel with. */
 const onConnectProxy = (port: number, options: any) => {
-  if (options?.profile) {
-    console.log(`Start proxy: ${port} via hlt client with profile: ${options.profile}`);
-    startClient({
-      port,
-      options,
-    })
-  }
+  const canTunnel = options?.profile || (options?.server && options?.token);
+  if (!canTunnel) return;
+
+  console.log(
+    `Start proxy: ${port} via hlt client with profile: ${options.profile || PROFILE_DEFAULT}`
+  );
+  startClient({
+    port,
+    options: tunnelArgs(options),
+  })
 }
 
 // profile

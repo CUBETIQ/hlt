@@ -3,6 +3,7 @@ const { EventEmitter } = require("events");
 const jwt = require("jsonwebtoken");
 const { TunnelSocketManager, TunnelResponse, TunnelRequest } = require("../lib");
 const { TelemetryManager } = require("../stats");
+const { ClaimRegistry } = require("../hostnames");
 const { AppConfig } = require("../config");
 
 describe("TunnelSocketManager", () => {
@@ -147,6 +148,39 @@ describe("TelemetryManager", () => {
       bytesOut: 2500,
       totalTunnelsCreated: 1,
     });
+  });
+});
+
+describe("ClaimRegistry", () => {
+  test("holds a name for an identified client but frees an unidentified one", () => {
+    const registry = new ClaimRegistry(60_000);
+
+    expect(registry.claim(["app"], "acme", "sock-1").ok).toBe(true);
+    registry.release(["app"], "sock-1");
+    // Still reserved for acme during the grace period...
+    expect(registry.claim(["app"], "intruder", "sock-2")).toEqual({
+      ok: false,
+      error: "'app' is already taken",
+    });
+    // ...and acme gets it back.
+    expect(registry.claim(["app"], "acme", "sock-3").ok).toBe(true);
+
+    // A client with no id cannot prove it is the same client next time, so
+    // reserving its name would brick it (this is the webhook 409 bug).
+    expect(registry.claim(["anon"], null, "sock-4").ok).toBe(true);
+    registry.release(["anon"], "sock-4");
+    expect(registry.owner("anon")).toBeNull();
+    expect(registry.claim(["anon"], null, "sock-5").ok).toBe(true);
+  });
+
+  test("releaseOwner drops every name a client holds", () => {
+    const registry = new ClaimRegistry(60_000);
+    registry.claim(["a", "b"], "acme", "sock-1");
+    registry.claim(["c"], "other", "sock-2");
+
+    expect(registry.releaseOwner("acme")).toBe(2);
+    expect(registry.owner("a")).toBeNull();
+    expect(registry.owner("c")).not.toBeNull();
   });
 });
 

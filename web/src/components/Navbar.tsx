@@ -26,6 +26,14 @@ interface NavbarProps {
   onLogout: () => void
 }
 
+const REFRESH_OPTIONS = [0, 3000, 5000, 10000, 30000, 60000]
+
+/** The trigger renders the raw value unless we map it back to a label. */
+function refreshLabel(ms: number): string {
+  if (!ms) return "Auto: Off"
+  return ms >= 60000 ? `Auto: ${ms / 60000}m` : `Auto: ${ms / 1000}s`
+}
+
 export function Navbar({
   instanceId,
   isOnline,
@@ -103,14 +111,16 @@ export function Navbar({
               onValueChange={(val: string | null) => val !== null && val !== undefined && onIntervalChange(Number(val))}
             >
               <SelectTrigger className="h-6 w-24 border-0 bg-transparent px-1.5 text-[11px] font-mono shadow-none focus:ring-0">
-                <SelectValue />
+                <SelectValue>
+                  {(value: unknown) => refreshLabel(Number(value ?? autoRefreshInterval))}
+                </SelectValue>
               </SelectTrigger>
               <SelectContent align="end">
-                <SelectItem value="0">Auto: Off</SelectItem>
-                <SelectItem value="3000">Auto: 3s</SelectItem>
-                <SelectItem value="5000">Auto: 5s</SelectItem>
-                <SelectItem value="10000">Auto: 10s</SelectItem>
-                <SelectItem value="30000">Auto: 30s</SelectItem>
+                {REFRESH_OPTIONS.map((ms) => (
+                  <SelectItem key={ms} value={String(ms)}>
+                    {refreshLabel(ms)}
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
           </div>

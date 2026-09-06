@@ -346,6 +346,32 @@ class TelemetryManager extends EventEmitter {
     if (bytesOut) this._bump(host, clientId, "out", bytesOut);
   }
 
+  /** Erase a host's stored counters (admin purge). */
+  async forgetHost(host) {
+    this.memoryStats.hosts.delete(host);
+    this._pending.hosts.delete(host);
+    const redis = this._redis();
+    if (redis) {
+      try {
+        await redis.del(`hlt:stats:hosts:${host}`);
+      } catch {}
+    }
+  }
+
+  /** Erase a client's stored history (admin purge). */
+  async forgetClient(clientId) {
+    const id = clientId || "anonymous";
+    this.memoryStats.clients.delete(id);
+    // Drop buffered deltas too, or the next flush resurrects the row.
+    this._pending.clients.delete(id);
+    const redis = this._redis();
+    if (redis) {
+      try {
+        await redis.multi().del(`hlt:clients:${id}`).sRem("hlt:clients", id).exec();
+      } catch {}
+    }
+  }
+
   /**
    * Cumulative per-client history (Redis-backed when enabled, so it is shared by
    * every worker and survives both disconnects and restarts).

@@ -26,6 +26,9 @@ const DEFAULT_RESERVED = [
 // A DNS label: lowercase alphanumeric plus inner hyphens, 1-63 chars.
 const LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
+// Marks a claim held by a connection rather than by an identified client.
+const ANON_OWNER_PREFIX = "socket:";
+
 const reservedSet = new Set([
   ...DEFAULT_RESERVED,
   ...tunnelConfig.reserved,
@@ -144,13 +147,31 @@ class ClaimRegistry {
       const entry = this.claims.get(name);
       // A reconnect may already have re-claimed the name on a new socket.
       if (!entry || (socketId && entry.socketId !== socketId)) continue;
-      if (this.ttlMs <= 0) {
+      // Reserving a name for an unidentified client only makes it unusable:
+      // nothing can ever prove it is the same client coming back.
+      if (this.ttlMs <= 0 || !entry.clientId) {
         this.claims.delete(name);
       } else {
         entry.socketId = null;
         entry.lastSeen = Date.now();
       }
     }
+  }
+
+  /** Drop every name owned by a client. Used by the admin purge. */
+  releaseOwner(clientId) {
+    let removed = 0;
+    for (const [name, entry] of this.claims.entries()) {
+      if (entry.clientId === clientId) {
+        this.claims.delete(name);
+        removed++;
+      }
+    }
+    return removed;
+  }
+
+  deleteName(name) {
+    this.claims.delete(name);
   }
 
   /** Names currently held by a client (owned, not necessarily connected). */
@@ -183,7 +204,9 @@ class RedisClaimRegistry {
   }
 
   async claim(names, clientId, socketId) {
-    const owner = String(clientId || `socket:${socketId}`);
+    // A token with no clientId claim has no durable identity, so its claim is
+    // scoped to the connection and must never outlive it (see release()).
+    const owner = String(clientId || `${ANON_OWNER_PREFIX}${socketId}`);
     const granted = [];
 
     for (const name of names) {
@@ -194,7 +217,13 @@ class RedisClaimRegistry {
         if (!ok) {
           const held = await this.redis.get(key);
           if (held && held !== owner) {
-            return { ok: false, error: `'${name}' is already taken` };
+            // A leftover connection-scoped claim belongs to a socket that no
+            // longer exists (the owner crashed before releasing). Taking it over
+            // is the only way the name ever becomes usable again.
+            if (!held.startsWith(ANON_OWNER_PREFIX)) {
+              return { ok: false, error: `'${name}' is already taken` };
+            }
+            await this.redis.set(key, owner);
           }
         }
         // Held names never expire while their owner is connected.
@@ -219,7 +248,12 @@ class RedisClaimRegistry {
     for (const name of names || []) {
       const key = this.key(name);
       try {
-        if (this.ttlMs <= 0) {
+        // The grace period is a courtesy to a *identified* client reconnecting.
+        // Holding a name for a connection-scoped owner just makes it unusable
+        // for the whole TTL, since that owner can never come back.
+        const held = await this.redis.get(key);
+        const anonymous = !held || held.startsWith(ANON_OWNER_PREFIX);
+        if (this.ttlMs <= 0 || anonymous) {
           await this.redis.del(key);
         } else {
           await this.redis.pExpire(key, this.ttlMs);
@@ -228,6 +262,34 @@ class RedisClaimRegistry {
         // The TTL will not be refreshed; the name frees itself either way.
       }
     }
+  }
+
+  /** Drop every name owned by a client. Used by the admin purge. */
+  async releaseOwner(clientId) {
+    const owner = String(clientId);
+    let removed = 0;
+    try {
+      for await (const batch of this.redis.scanIterator({ MATCH: this.key("*"), COUNT: 200 })) {
+        const keys = Array.isArray(batch) ? batch : [batch];
+        if (keys.length === 0) continue;
+        const held = await this.redis.mGet(keys);
+        const mine = keys.filter((_, i) => held[i] === owner);
+        if (mine.length) {
+          await this.redis.del(mine);
+          removed += mine.length;
+        }
+      }
+    } catch {
+      // Best effort: a claim we cannot reach expires on its own TTL.
+    }
+    return removed;
+  }
+
+  /** Drop one name outright, whoever holds it. */
+  async deleteName(name) {
+    try {
+      await this.redis.del(this.key(name));
+    } catch {}
   }
 }
 

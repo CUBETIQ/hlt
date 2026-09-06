@@ -230,6 +230,23 @@ if (cluster.isPrimary || cluster.isMaster) {
             c.bytes_out += delta.out || 0;
             c.lastSeen = Date.now();
           }
+        } else if (msg.type === "FORGET_HOST" && msg.host) {
+          // Admin purge: drop the aggregated record, not just the live socket.
+          clusterSockets.delete(msg.host);
+          clusterStats.hostStats.delete(msg.host);
+          for (const c of clusterClients.values()) c.activeHosts.delete(msg.host);
+        } else if (msg.type === "FORGET_CLIENT" && msg.clientId) {
+          const entry = clusterClients.get(msg.clientId);
+          if (entry) {
+            for (const host of entry.activeHosts) {
+              clusterSockets.delete(host);
+              clusterStats.hostStats.delete(host);
+            }
+            clusterClients.delete(msg.clientId);
+          }
+          claims.releaseOwner(msg.clientId);
+        } else if (msg.type === "FORGET_NAME" && msg.name) {
+          claims.deleteName(msg.name);
         } else if (msg.type === "GET_CLUSTER_STATE" && msg.reqId) {
           const socketsList = Array.from(clusterSockets.values()).map((s) => ({
             ...s,
