@@ -265,10 +265,13 @@ program
         await getToken(config.server, {
           clientId: config.clientId,
           apiKey: config.apiKey,
+          // Renewal of an id we already hold.
+          currentToken: config.token,
         })
           .then((resp: any) => {
             if (resp.data?.token) {
               config.token = resp.data?.token;
+              if (resp.data?.clientId) config.clientId = resp.data.clientId;
               console.log("Token acquired successfully!");
             } else {
               errorCode = 1;

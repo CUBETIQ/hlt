@@ -1,4 +1,5 @@
 const realWs = require("./ws_patch");
+const crypto = require("crypto");
 const http = require("http");
 const {
   generateUUID: uuidV4,
@@ -59,6 +60,9 @@ io.engine.on("connection_error", (err) => {
 // Set once Redis is connected; until then name claims fall back to the in-process
 // (or cluster-primary) registry.
 let redisClaims = null;
+// Client-id ownership. Starts in-memory and is upgraded to Redis on connect, so
+// the rule survives restarts and holds across nodes.
+const clientIds = new hostnames.ClientIdRegistry();
 const redisConfig = AppConfig.redis;
 if (redisConfig && redisConfig.enabled && redisConfig.url) {
   // Never log credentials that may be embedded in the URL.
@@ -114,6 +118,7 @@ if (redisConfig && redisConfig.enabled && redisConfig.url) {
     // With Redis available, tunnel-name ownership moves out of process memory so
     // a client keeps its URL across a restart or a move to another node.
     redisClaims = new hostnames.RedisClaimRegistry(pubClient);
+    clientIds.redis = pubClient;
     logger.info(`Redis adapter, telemetry and name claims connected: ${safeUrl}`);
   };
   pubClient.on("ready", onReady);
@@ -444,15 +449,24 @@ io.use((socket, next) => {
     const handshakeAuth = socket.handshake.auth || {};
     socket.clientLabel =
       socket.clientId || handshakeAuth.clientId || handshakeAuth.apiKey || null;
+    // Who owns the tunnel names. A token minted before clientId was a claim has
+    // no durable identity, so fall back to the token itself: stable across
+    // reconnects (so the same client reclaims its name) without ever being
+    // matchable by a different client.
+    socket.claimOwner =
+      socket.clientId ||
+      `token:${crypto.createHash("sha256").update(String(token)).digest("hex").slice(0, 24)}`;
     socket.connectHost = connectHost;
 
     const existsSocket = tunnelSockets[connectHost];
     if (existsSocket && existsSocket.connected) {
       // Only the client that owns the host may take it over. Without this any
       // authenticated client could evict another tenant's tunnel by connecting
-      // to its host with keep_connection.
+      // to its host with keep_connection. Compare claim owners, not client ids:
+      // two tokens that both lack a clientId are different clients, and treating
+      // them as equal let one evict the other.
       const sameOwner =
-        (existsSocket.clientId || null) === (decoded.clientId || null);
+        (existsSocket.claimOwner || null) === (socket.claimOwner || null);
       if (
         existsSocket.id === socket.id ||
         (sameOwner && socket.handshake.auth?.keep_connection === true)
@@ -479,7 +493,7 @@ io.use((socket, next) => {
       return next(new Error(`[409-HOSTNAME] ${resolved.error}`));
     }
 
-    claimNames(resolved.names, decoded.clientId || null, socket.id)
+    claimNames(resolved.names, socket.claimOwner, socket.id)
       .then((result) => {
         if (!result || !result.ok) {
           return next(
@@ -632,16 +646,57 @@ app.use((req, res, next) => {
 const apiRouter = express.Router();
 apiRouter.use(bodyParser.json());
 
-const handleTokenGeneration = (req, res) => {
-  const body = req.body || {};
-  const clientId = req.query.client || body.clientId || uuidV4();
-  const apiKey = req.query.key || body.apiKey || "";
+/** A token the caller already holds, offered as proof of an existing identity. */
+function presentedToken(req) {
+  const header = req.headers.authorization || "";
+  if (header.startsWith("Bearer ")) return header.substring(7);
+  return (req.body && req.body.token) || req.query.token || null;
+}
 
-  if (!securityConfig.public_token_registration) {
-    if (securityConfig.server_api_key && apiKey !== securityConfig.server_api_key) {
-      return res.status(403).json({ error: "Invalid API key" });
+function tokenClientId(token) {
+  if (!token) return null;
+  try {
+    return jwt.verify(token, securityConfig.secret_key).clientId || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Issue a tunnel token. The client id in the token IS the identity that tunnel
+ * names are locked to, so it is minted here rather than taken on trust:
+ *   - no id requested  -> a fresh unique one
+ *   - unknown id       -> granted and recorded to the requester
+ *   - known id         -> only re-issued to a caller presenting a valid token
+ *                         for it (renewal), or to an operator with the API key
+ * Without this, a second device could ask for someone else's client id and take
+ * over their reserved hostnames.
+ */
+const handleTokenGeneration = async (req, res) => {
+  const body = req.body || {};
+  const requested = String(req.query.client || body.clientId || "").trim();
+  const apiKey = req.query.key || body.apiKey || "";
+  const isOperator = !!(securityConfig.server_api_key && apiKey === securityConfig.server_api_key);
+
+  if (!securityConfig.public_token_registration && !isOperator) {
+    return res.status(403).json({ error: "Invalid API key" });
+  }
+
+  let clientId = requested;
+  if (!clientId) {
+    clientId = uuidV4();
+  } else if (!isOperator && (await clientIds.exists(clientId))) {
+    // Renewal is allowed; a land-grab is not.
+    if (tokenClientId(presentedToken(req)) !== clientId) {
+      return res.status(409).json({
+        error: `client id '${clientId}' is already registered`,
+        code: "CLIENT_ID_TAKEN",
+        hint: "Send your existing token as a Bearer header to renew it, or omit clientId to be issued a new one.",
+      });
     }
   }
+
+  await clientIds.reserve(clientId, { via: isOperator ? "operator" : "public" });
 
   const payload = {
     token: securityConfig.verify_token || "valid",
@@ -690,7 +745,6 @@ const adminRouter = express.Router();
 adminRouter.use(bodyParser.json());
 
 // Constant-time compare that does not leak length via an early return.
-const crypto = require("crypto");
 const safeEqual = (a, b) => {
   const ha = crypto.createHash("sha256").update(String(a)).digest();
   const hb = crypto.createHash("sha256").update(String(b)).digest();
@@ -1033,6 +1087,8 @@ adminRouter.delete("/clients/:clientId", adminAuthMiddleware, async (req, res) =
   let releasedNames = 0;
   if (redisClaims) releasedNames = await redisClaims.releaseOwner(clientId);
   else if (localClaims) releasedNames = localClaims.releaseOwner(clientId);
+  // Removing a client frees its id for registration again.
+  await clientIds.forget(clientId);
 
   res.status(200).json({
     clientId,
@@ -1051,9 +1107,12 @@ adminRouter.get("/stats", adminAuthMiddleware, async (req, res) => {
   res.status(200).json(combinedStats);
 });
 
-adminRouter.post("/tokens/generate", adminAuthMiddleware, (req, res) => {
+adminRouter.post("/tokens/generate", adminAuthMiddleware, async (req, res) => {
   const { clientId, expiresIn } = req.body || {};
   const cid = clientId || uuidV4();
+  // The console is the operator: it may mint any id, but the id is still
+  // recorded so a public caller cannot later claim it.
+  await clientIds.reserve(cid, { via: "admin" });
   const token = jwt.sign(
     {
       token: securityConfig.verify_token || "valid",

@@ -9,6 +9,8 @@ export interface TokenPayload {
   clientId?: string;
   apiKey?: string;
   timestamp?: number;
+  /** An existing token for `clientId`, presented when renewing it. */
+  currentToken?: string;
 }
 
 export interface TokenResponse {
@@ -38,6 +40,9 @@ export async function getToken(
     headers: {
       "Content-Type": "application/json",
       "Accept-Encoding": "identity",
+      // Proof that we already hold this client id, so the server treats the
+      // request as a renewal instead of a land-grab on someone else's id.
+      ...(data.currentToken ? { Authorization: `Bearer ${data.currentToken}` } : {}),
     },
   });
 }
@@ -121,6 +126,10 @@ export class HltClient {
       clientId: this.config.clientId,
       apiKey: this.config.apiKey,
     });
+    // Adopt the id the server issued: it is the identity tunnel names lock to.
+    if (resp.data?.clientId) {
+      this.config.clientId = resp.data.clientId;
+    }
     if (!resp.data?.token) {
       throw new Error(
         "Failed to acquire token from HLT server: " + JSON.stringify(resp.data)

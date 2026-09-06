@@ -151,8 +151,11 @@ export class HttpTunnelClient implements Client {
             config.token = options.token;
         }
 
-        if (!config.clientId) {
-            config.clientId = options.client || generateUUID();
+        // A client id is an identity the server locks tunnel names to, so it is
+        // minted by the server (below) rather than made up here. `--client` still
+        // asks for a specific one, which the server grants only if it is free.
+        if (!config.clientId && options.client) {
+            config.clientId = options.client;
         }
 
         if (!config.apiKey && options.key) {
@@ -166,22 +169,67 @@ export class HttpTunnelClient implements Client {
                 timestamp: (new Date().getTime()),
                 clientId: config.clientId,
                 apiKey: config.apiKey,
+                // Renewing our own id, not claiming someone else's.
+                currentToken: config.token,
             })
                 .then((resp: any) => {
                     if (resp.data?.token) {
                         console.log("Token generated successfully!");
                         config.token = resp.data?.token;
+                        // The server is the authority on the id it issued.
+                        if (resp.data?.clientId) {
+                            config.clientId = resp.data.clientId;
+                        }
                     } else {
                         errorCode = 1;
                         console.error("Generate token failed, return with null or empty from server!", resp);
                         return;
                     }
                 })
-                .catch((err: any) => {
+                .catch(async (err: any) => {
                     errorCode = 1;
-                    console.error("cannot get token from server", err);
-                    return;
+                    const data = err?.response?.data;
+                    if (data?.code !== "CLIENT_ID_TAKEN") {
+                        console.error("cannot get token from server", data?.error || err?.message || err);
+                        return;
+                    }
+
+                    // The id is registered and we cannot prove we hold it (a lost
+                    // or expired token). `--force` means "give me a new identity",
+                    // so take one rather than leaving the profile unusable.
+                    if (!options.force) {
+                        console.error(
+                            `\x1b[31m✖ ${data.error}\x1b[0m\n` +
+                            `  ${data.hint}\n` +
+                            `  Or run \x1b[1mhlt init -p ${profile} -f\x1b[0m to be issued a fresh identity.`
+                        );
+                        return;
+                    }
+
+                    console.warn(
+                        `\x1b[33m! ${data.error} — requesting a fresh client id (your public URL will change).\x1b[0m`
+                    );
+                    await getToken(config.server, {
+                        timestamp: Date.now(),
+                        apiKey: config.apiKey,
+                    })
+                        .then((resp: any) => {
+                            if (!resp.data?.token) return;
+                            config.token = resp.data.token;
+                            config.clientId = resp.data.clientId || config.clientId;
+                            errorCode = 0;
+                            console.log(`Token generated successfully! New client id: ${config.clientId}`);
+                        })
+                        .catch((e: any) => {
+                            console.error("cannot get token from server", e?.response?.data?.error || e?.message || e);
+                        });
                 });
+        }
+
+        if (!config.clientId) {
+            // Older server that does not return an id: keep the previous
+            // behaviour so init still produces a usable profile.
+            config.clientId = generateUUID();
         }
 
         if (errorCode === 0) {
@@ -340,6 +388,14 @@ export class HttpTunnelClient implements Client {
 
             // A rejection (4xx) is the server's verdict and retrying elsewhere
             // will not change it; a transport failure is worth another node.
+            if (message.includes("[409-HOSTNAME]")) {
+                this.stats.error(
+                    `  \x1b[90mThat public name belongs to another client id. Pick another with\x1b[0m ` +
+                    `\x1b[1m-n <name>\x1b[0m\x1b[90m, or issue this profile a fresh identity with\x1b[0m ` +
+                    `\x1b[1mhlt init -p ${profile} -f\x1b[0m\x1b[90m. An admin can free it from the console.\x1b[0m`
+                );
+            }
+
             const rejected = message.startsWith("[40");
             if (!rejected && ++this.connectFailures >= 3) {
                 this.connectFailures = 0;

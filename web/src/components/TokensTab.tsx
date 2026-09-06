@@ -280,6 +280,12 @@ export function TokensTab() {
               <code className="font-mono">-S a,b</code> failover nodes
             </div>
             <div>
+              <span className="font-medium text-foreground">The client id is an identity.</span>{" "}
+              Tunnel names are locked to it, and once issued it is only re-issued to a caller
+              presenting a valid token for it — so a second machine cannot take over a client's
+              names. Removing a client here frees its id and its reserved names.
+            </div>
+            <div>
               <span className="font-medium text-foreground">Treat the token as a password.</span>{" "}
               It carries the client id and stays valid until it expires; generate a new one per
               machine and revoke by rotating <code className="font-mono">SECRET_KEY</code>.

@@ -3,7 +3,7 @@ const { EventEmitter } = require("events");
 const jwt = require("jsonwebtoken");
 const { TunnelSocketManager, TunnelResponse, TunnelRequest } = require("../lib");
 const { TelemetryManager } = require("../stats");
-const { ClaimRegistry } = require("../hostnames");
+const { ClaimRegistry, ClientIdRegistry } = require("../hostnames");
 const { AppConfig } = require("../config");
 
 describe("TunnelSocketManager", () => {
@@ -173,6 +173,19 @@ describe("ClaimRegistry", () => {
     expect(registry.claim(["anon"], null, "sock-5").ok).toBe(true);
   });
 
+  test("a token-scoped owner reclaims its own name but is not shared", () => {
+    const registry = new ClaimRegistry(60_000);
+    // Tokens without a clientId claim own their names via a token fingerprint:
+    // stable across reconnects, distinct between tokens.
+    expect(registry.claim(["docs"], "token:aaa", "sock-1").ok).toBe(true);
+    // Same token, new connection (the client crashed and came back).
+    expect(registry.claim(["docs"], "token:aaa", "sock-2").ok).toBe(true);
+    registry.release(["docs"], "sock-2");
+    // Ephemeral claims are not held after release, so the name is free again.
+    expect(registry.owner("docs")).toBeNull();
+    expect(registry.claim(["docs"], "token:bbb", "sock-3").ok).toBe(true);
+  });
+
   test("releaseOwner drops every name a client holds", () => {
     const registry = new ClaimRegistry(60_000);
     registry.claim(["a", "b"], "acme", "sock-1");
@@ -181,6 +194,21 @@ describe("ClaimRegistry", () => {
     expect(registry.releaseOwner("acme")).toBe(2);
     expect(registry.owner("a")).toBeNull();
     expect(registry.owner("c")).not.toBeNull();
+  });
+});
+
+describe("ClientIdRegistry", () => {
+  test("records an id once, so a second holder is detectable", async () => {
+    const ids = new ClientIdRegistry();
+
+    expect(await ids.exists("acme")).toBe(false);
+    expect(await ids.reserve("acme")).toBe(true);
+    expect(await ids.exists("acme")).toBe(true);
+    // A second caller asking for the same id is not the first one.
+    expect(await ids.reserve("acme")).toBe(false);
+
+    await ids.forget("acme");
+    expect(await ids.exists("acme")).toBe(false);
   });
 });
 

@@ -113,6 +113,18 @@ hlt proxy 8080 https://api.example.com
 hlt proxy 8080 tcp://127.0.0.1:5432
 ```
 
+## Client identity
+
+Your token carries a **client id**, and public tunnel names are locked to it. The
+server issues that id — `hlt init` stores whatever it gets back — so no other
+machine can be issued a token for your id and take over your names.
+
+- Renewing (`hlt init -f`, `hlt config token new`) presents your current token
+  and keeps the same id.
+- Lost the token but kept the id? `hlt init -p <profile> -f` issues a fresh
+  identity; your public URL changes with it.
+- Each profile has its own id, so `-p work` and `-p personal` never collide.
+
 ## Config
 
 ```shell

@@ -26,8 +26,12 @@ const DEFAULT_RESERVED = [
 // A DNS label: lowercase alphanumeric plus inner hyphens, 1-63 chars.
 const LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
-// Marks a claim held by a connection rather than by an identified client.
-const ANON_OWNER_PREFIX = "socket:";
+// Owners that are not a durable client id: a bare connection ("socket:") or a
+// specific token ("token:", stable across reconnects but not across re-issues).
+// Their claims are never held past the connection, because nothing can prove the
+// same client is coming back.
+const EPHEMERAL_OWNER = /^(socket|token):/;
+const isEphemeralOwner = (owner) => EPHEMERAL_OWNER.test(String(owner || ""));
 
 const reservedSet = new Set([
   ...DEFAULT_RESERVED,
@@ -126,7 +130,7 @@ class ClaimRegistry {
     const wanted = [];
     for (const name of names) {
       const held = this.owner(name);
-      if (held && held.clientId !== clientId) {
+      if (held && held.clientId !== clientId && !isEphemeralOwner(held.clientId)) {
         return { ok: false, error: `'${name}' is already taken` };
       }
       if (!wanted.includes(name)) wanted.push(name);
@@ -149,7 +153,7 @@ class ClaimRegistry {
       if (!entry || (socketId && entry.socketId !== socketId)) continue;
       // Reserving a name for an unidentified client only makes it unusable:
       // nothing can ever prove it is the same client coming back.
-      if (this.ttlMs <= 0 || !entry.clientId) {
+      if (this.ttlMs <= 0 || !entry.clientId || isEphemeralOwner(entry.clientId)) {
         this.claims.delete(name);
       } else {
         entry.socketId = null;
@@ -206,7 +210,7 @@ class RedisClaimRegistry {
   async claim(names, clientId, socketId) {
     // A token with no clientId claim has no durable identity, so its claim is
     // scoped to the connection and must never outlive it (see release()).
-    const owner = String(clientId || `${ANON_OWNER_PREFIX}${socketId}`);
+    const owner = String(clientId || `socket:${socketId}`);
     const granted = [];
 
     for (const name of names) {
@@ -217,10 +221,10 @@ class RedisClaimRegistry {
         if (!ok) {
           const held = await this.redis.get(key);
           if (held && held !== owner) {
-            // A leftover connection-scoped claim belongs to a socket that no
-            // longer exists (the owner crashed before releasing). Taking it over
-            // is the only way the name ever becomes usable again.
-            if (!held.startsWith(ANON_OWNER_PREFIX)) {
+            // A leftover ephemeral claim belongs to a connection or token that
+            // is gone (the owner crashed before releasing). Taking it over is
+            // the only way the name ever becomes usable again.
+            if (!isEphemeralOwner(held)) {
               return { ok: false, error: `'${name}' is already taken` };
             }
             await this.redis.set(key, owner);
@@ -252,8 +256,7 @@ class RedisClaimRegistry {
         // Holding a name for a connection-scoped owner just makes it unusable
         // for the whole TTL, since that owner can never come back.
         const held = await this.redis.get(key);
-        const anonymous = !held || held.startsWith(ANON_OWNER_PREFIX);
-        if (this.ttlMs <= 0 || anonymous) {
+        if (this.ttlMs <= 0 || !held || isEphemeralOwner(held)) {
           await this.redis.del(key);
         } else {
           await this.redis.pExpire(key, this.ttlMs);
@@ -293,6 +296,67 @@ class RedisClaimRegistry {
   }
 }
 
+/**
+ * Which client ids exist, and therefore who may be issued a token for one.
+ *
+ * A client id is an identity: tunnel names are locked to it, so letting any
+ * caller mint a token for an arbitrary id would let one device take over
+ * another's names. Once an id has been issued it is only re-issued to a caller
+ * that can present a valid token for it (a renewal) or to an operator using the
+ * server API key.
+ *
+ * Redis-backed when available so the rule holds across nodes and restarts;
+ * in-memory otherwise (a restart then forgets, which is no worse than before).
+ */
+class ClientIdRegistry {
+  constructor(redis = null) {
+    this.redis = redis;
+    this.local = new Map();
+  }
+
+  key(clientId) {
+    return `hlt:id:${clientId}`;
+  }
+
+  async exists(clientId) {
+    if (this.redis) {
+      try {
+        return (await this.redis.exists(this.key(clientId))) === 1;
+      } catch {
+        // Cannot verify: fall back to what this node knows.
+      }
+    }
+    return this.local.has(clientId);
+  }
+
+  /** Record the id. Returns false when someone else got there first. */
+  async reserve(clientId, meta = {}) {
+    const record = { issued_at: String(Date.now()), ...meta };
+    if (this.redis) {
+      try {
+        const fresh = await this.redis.hSetNX(this.key(clientId), "issued_at", record.issued_at);
+        await this.redis.hSet(this.key(clientId), { ...record, last_issued_at: record.issued_at });
+        this.local.set(clientId, record);
+        return fresh === true || fresh === 1;
+      } catch {
+        // Fall through to the local map.
+      }
+    }
+    const fresh = !this.local.has(clientId);
+    this.local.set(clientId, record);
+    return fresh;
+  }
+
+  async forget(clientId) {
+    this.local.delete(clientId);
+    if (this.redis) {
+      try {
+        await this.redis.del(this.key(clientId));
+      } catch {}
+    }
+  }
+}
+
 module.exports = {
   isEnabled,
   buildHost,
@@ -302,6 +366,7 @@ module.exports = {
   validateName,
   ClaimRegistry,
   RedisClaimRegistry,
+  ClientIdRegistry,
   tunnelConfig,
   reservedSet,
 };
