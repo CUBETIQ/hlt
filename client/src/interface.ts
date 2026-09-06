@@ -19,6 +19,10 @@ export interface Options {
     host?: string;
     autoinit?: boolean; // auto init the profile (if profile not found)
     names?: string[]; // requested public tunnel names (default: the client id)
+    /** silent | error | warn | info (default) | debug */
+    logLevel?: string;
+    /** false hides the live status line; counters keep running. */
+    stats?: boolean;
 
     // [key: string]: any;
 }

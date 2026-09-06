@@ -1,4 +1,4 @@
-import { Argument, InvalidArgumentError, program } from "commander";
+import { Argument, Command, InvalidArgumentError, program } from "commander";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -8,6 +8,8 @@ import { listProfile } from "./manage";
 import { createProxyServer } from "./proxy";
 import { createProxyServer as createProxyTCPServer } from "./proxy_tcp";
 import { getToken } from './sdk';
+import { confirmPublicShare, createFileServer } from "./serve";
+import { checkForUpdate, runUpgrade, updateBanner } from "./update";
 import { generateUUID, isValidHost, isValidUrl, randomPort } from "./util";
 import { startWebhookServer } from "./webhook";
 
@@ -20,11 +22,53 @@ program
   )
   .version(`v${packageInfo.version}`);
 
+/**
+ * Options every tunnel-starting command shares. `--server`/`--token` override
+ * the stored profile (and together make the profile optional entirely).
+ */
+const tunnelOptions = (cmd: Command): Command =>
+  cmd
+    .option(
+      "-S, --server <url>",
+      "server url, overrides the profile (comma separated for failover nodes)"
+    )
+    .option("-t, --token <jwt>", "auth token, overrides the profile")
+    .option("-p, --profile <string>", "profile name", PROFILE_DEFAULT)
+    .option("-k, --key <string>", "client api key for authentication access")
+    .option(
+      "-n, --name <names>",
+      "comma separated public tunnel names to reserve (default: client id)"
+    )
+    .option("--log-level <level>", "silent | error | warn | info | debug", "info")
+    .option("-q, --quiet", "only log errors (the live stats line stays)", false)
+    .option("-d, --debug", "verbose logging", false)
+    .option("--no-stats", "hide the live stats line")
+    .option("--no-update-check", "skip the daily version check");
+
+/** Normalise the shared flags into the Options shape the client expects. */
+const tunnelArgs = (options: any) => ({
+  ...options,
+  logLevel: options.debug ? "debug" : options.quiet ? "error" : options.logLevel,
+  names: options.name
+    ? String(options.name).split(",").map((s: string) => s.trim()).filter(Boolean)
+    : undefined,
+});
+
+/** Non-blocking: never delays the tunnel, never fails the command. */
+const noticeUpdate = (options: any) => {
+  if (options.updateCheck === false) return;
+  checkForUpdate(packageInfo.version)
+    .then((latest) => {
+      if (latest) console.log(`\n${updateBanner(latest, packageInfo.version)}\n`);
+    })
+    .catch(() => { });
+};
+
 // init
 program
   .command("init")
   .description("initialize client configuration and acquire JWT token")
-  .option("-s, --server <string>", "setting server url", SERVER_DEFAULT_URL)
+  .option("-S, --server <string>", "setting server url", SERVER_DEFAULT_URL)
   .option(
     "-t, --token <string>",
     "setting token (defaults to auto-acquiring from server)",
@@ -42,31 +86,28 @@ program
   });
 
 // start
-program
-  .command("start")
-  .description("start a connection with specific port")
-  .argument("<port> | <address>", "local server port number or address", (value) => {
-    if (isValidHost(value)) {
-      return value;
-    }
+tunnelOptions(
+  program
+    .command("start")
+    .description("start a connection with specific port")
+    .argument("<port> | <address>", "local server port number or address", (value) => {
+      if (isValidHost(value)) {
+        return value;
+      }
 
-    const port = parseInt(value, 10);
-    if (isNaN(port)) {
-      throw new InvalidArgumentError("Not a number or valid address.");
-    }
-    return port;
-  })
+      const port = parseInt(value, 10);
+      if (isNaN(port)) {
+        throw new InvalidArgumentError("Not a number or valid address.");
+      }
+      return port;
+    })
+)
   .option("-s, --suffix <string>", "suffix for client name")
   .option(
     "-K, --keep_connection <boolean>",
     "keep connection for client and old connection will be closed (override connection)",
     true
   )
-  .option(
-    "-k --key <string>",
-    "setting client api key for authentication access"
-  )
-  .option("-p, --profile <string>", "profile name", PROFILE_DEFAULT)
   .option("-h, --host <string>", "local host value", "localhost")
   .option("-o, --origin <string>", "change request origin")
   .option(
@@ -74,21 +115,81 @@ program
     "host header sent to the local app: preserve (default), rewrite (use the local host:port — needed by Next.js/Vite dev servers that 403 cross-origin /_next/* requests), or an explicit host",
     "preserve"
   )
-  .option(
-    "-n, --name <names>",
-    "comma separated public tunnel names to reserve (default: client id)"
-  )
   .action((portOrAddress, options) => {
+    noticeUpdate(options);
     startClient({
       port: portOrAddress,
       address: portOrAddress,
-      options: {
-        ...options,
-        names: options.name
-          ? String(options.name).split(",").map((s: string) => s.trim()).filter(Boolean)
-          : undefined,
-      },
+      options: tunnelArgs(options),
     })
+  });
+
+// serve — publish a local folder over the tunnel
+tunnelOptions(
+  program
+    .command("serve")
+    .description("serve a local folder (static file browser) and publish it over a tunnel")
+    .argument("[dir]", "directory to serve", ".")
+)
+  .option("--port <number>", "local port for the file server (default: random)")
+  .option("--bind <address>", "local bind address", "127.0.0.1")
+  .option("--auth <user:pass>", "protect the share with HTTP basic auth")
+  .option("--no-listing", "do not show a directory index (only direct file paths)")
+  .option("-y, --yes", "skip the public-exposure confirmation prompt", false)
+  .option("--local", "serve locally only, do not open a tunnel", false)
+  .action(async (dir, options) => {
+    const listing = options.listing !== false;
+    if (!options.local) {
+      const ok = await confirmPublicShare(dir, {
+        auth: options.auth,
+        listing,
+        assumeYes: options.yes,
+      });
+      if (!ok) {
+        console.log("\x1b[90mCancelled — nothing was published.\x1b[0m");
+        process.exit(0);
+      }
+    }
+
+    const port = parseInt(options.port, 10) || randomPort();
+    const server = createFileServer(dir, {
+      listing,
+      auth: options.auth,
+      bind: options.bind,
+    });
+
+    server.on("error", (err) => {
+      console.error(`\x1b[31m✖ File server error:\x1b[0m ${err.message}`);
+      process.exit(1);
+    });
+
+    server.listen(port, options.bind, () => {
+      console.log(
+        `\x1b[36m➜ Serving:\x1b[0m ${path.resolve(dir)} on http://${options.bind}:${port}` +
+        (options.auth ? " \x1b[32m(basic auth)\x1b[0m" : "")
+      );
+      if (options.local) return;
+
+      noticeUpdate(options);
+      startClient({
+        port,
+        options: { ...tunnelArgs(options), host: options.bind, autoinit: true },
+      });
+    });
+  });
+
+// upgrade
+program
+  .command("upgrade")
+  .description("upgrade the hlt cli to the latest published version")
+  .action(async () => {
+    const latest = await checkForUpdate(packageInfo.version);
+    if (!latest) {
+      console.log(`\x1b[32m✔ hlt v${packageInfo.version} is up to date.\x1b[0m`);
+      return;
+    }
+    console.log(`hlt v${packageInfo.version} → \x1b[32mv${latest}\x1b[0m`);
+    process.exit(await runUpgrade());
   });
 
 

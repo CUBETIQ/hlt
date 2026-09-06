@@ -21,19 +21,53 @@ import {
   RefreshIcon,
 } from "@/components/icons"
 
+/** One copyable command line. */
+function CommandRow({
+  command,
+  copied,
+  onCopy,
+  label,
+}: {
+  command: string
+  copied: boolean
+  onCopy: () => void
+  label?: string
+}) {
+  return (
+    <div className="space-y-1">
+      {label && <div className="text-[11px] text-muted-foreground">{label}</div>}
+      <div className="relative">
+        <div className="p-2 rounded bg-background border border-border/60 font-mono text-xs text-foreground overflow-x-auto whitespace-nowrap pr-9 flex items-center gap-1.5">
+          <TerminalIcon size={12} className="text-primary shrink-0" />
+          <code>{command}</code>
+        </div>
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          onClick={onCopy}
+          className="absolute right-1.5 top-1.5 size-6 text-muted-foreground hover:text-foreground"
+          title="Copy"
+        >
+          {copied ? <CheckIcon size={12} className="text-emerald-500" /> : <CopyIcon size={12} />}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 export function TokensTab() {
   const [clientId, setClientId] = useState("")
   const [expiresIn, setExpiresIn] = useState("30d")
   const [result, setResult] = useState<GenerateTokenResponse | null>(null)
   const [copiedToken, setCopiedToken] = useState(false)
-  const [copiedCli, setCopiedCli] = useState(false)
+  const [copiedKey, setCopiedKey] = useState<string | null>(null)
 
   const generateMutation = useGenerateToken()
 
   const handleGenerate = async (e: React.FormEvent) => {
     e.preventDefault()
     setCopiedToken(false)
-    setCopiedCli(false)
+    setCopiedKey(null)
 
     try {
       const res = await generateMutation.mutateAsync({
@@ -51,15 +85,15 @@ export function TokensTab() {
     setClientId(randomId)
   }
 
-  const copyToClipboard = async (text: string, type: "token" | "cli") => {
+  const copyToClipboard = async (text: string, key: string) => {
     try {
       await navigator.clipboard.writeText(text)
-      if (type === "token") {
+      if (key === "token") {
         setCopiedToken(true)
         setTimeout(() => setCopiedToken(false), 1500)
       } else {
-        setCopiedCli(true)
-        setTimeout(() => setCopiedCli(false), 1500)
+        setCopiedKey(key)
+        setTimeout(() => setCopiedKey(null), 1500)
       }
     } catch {
       // fallback
@@ -67,9 +101,14 @@ export function TokensTab() {
   }
 
   const serverUrl = window.location.origin
-  const cliCommand = result
-    ? `hlt start 8080 --server ${serverUrl} -t ${result.token}`
-    : ""
+  const token = result?.token || "<token>"
+  const commands = {
+    install: "npm install -g @cubetiq/hlt",
+    start: `hlt start 8080 --server ${serverUrl} -t ${token}`,
+    serve: `hlt serve ./public --server ${serverUrl} -t ${token}`,
+    save: `hlt init --server ${serverUrl} -t ${token}`,
+    upgrade: "hlt upgrade",
+  }
 
   return (
     <div className="space-y-4 max-w-3xl">
@@ -180,24 +219,74 @@ export function TokensTab() {
               </Button>
             </div>
 
-            <div className="relative">
-              <div className="p-2 rounded bg-background border border-border/60 font-mono text-xs text-foreground overflow-x-auto whitespace-nowrap pr-9 flex items-center gap-1.5">
-                <TerminalIcon size={12} className="text-primary shrink-0" />
-                <code>{cliCommand}</code>
-              </div>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                onClick={() => copyToClipboard(cliCommand, "cli")}
-                className="absolute right-1.5 top-1.5 size-6 text-muted-foreground hover:text-foreground"
-                title="Copy CLI Command"
-              >
-                {copiedCli ? <CheckIcon size={12} className="text-emerald-500" /> : <CopyIcon size={12} />}
-              </Button>
-            </div>
+            <CommandRow
+              label="Forward a local port"
+              command={commands.start}
+              copied={copiedKey === "start"}
+              onCopy={() => copyToClipboard(commands.start, "start")}
+            />
           </CardContent>
         </Card>
       )}
+
+      <Card className="border-border/60">
+        <CardHeader className="pb-3 flex-row items-center justify-between space-y-0">
+          <CardTitle className="text-sm font-semibold flex items-center gap-2">
+            <TerminalIcon size={16} className="text-primary" />
+            Install &amp; Connect
+          </CardTitle>
+          <span className="text-[11px] text-muted-foreground font-mono">@cubetiq/hlt</span>
+        </CardHeader>
+
+        <CardContent className="space-y-3">
+          <CommandRow
+            label="1. Install the CLI (or run it once with npx @cubetiq/hlt)"
+            command={commands.install}
+            copied={copiedKey === "install"}
+            onCopy={() => copyToClipboard(commands.install, "install")}
+          />
+          <CommandRow
+            label="2. Forward a local port — no config file needed with --server and -t"
+            command={commands.start}
+            copied={copiedKey === "start2"}
+            onCopy={() => copyToClipboard(commands.start, "start2")}
+          />
+          <CommandRow
+            label="3. Or publish a folder as a file browser (asks to confirm first)"
+            command={commands.serve}
+            copied={copiedKey === "serve"}
+            onCopy={() => copyToClipboard(commands.serve, "serve")}
+          />
+          <CommandRow
+            label="Save the token to a profile so later runs need no flags"
+            command={commands.save}
+            copied={copiedKey === "save"}
+            onCopy={() => copyToClipboard(commands.save, "save")}
+          />
+          <CommandRow
+            label="Keep the CLI current"
+            command={commands.upgrade}
+            copied={copiedKey === "upgrade"}
+            onCopy={() => copyToClipboard(commands.upgrade, "upgrade")}
+          />
+
+          <div className="rounded border border-border/50 bg-muted/30 p-2.5 space-y-1 text-[11px] text-muted-foreground">
+            <div>
+              <span className="font-medium text-foreground">Useful flags:</span>{" "}
+              <code className="font-mono">-n my-name</code> reserve a public name ·{" "}
+              <code className="font-mono">-q</code> quiet logs (live stats stay) ·{" "}
+              <code className="font-mono">--log-level debug</code> ·{" "}
+              <code className="font-mono">-H rewrite</code> for Next.js/Vite dev servers ·{" "}
+              <code className="font-mono">-s a,b</code> failover nodes
+            </div>
+            <div>
+              <span className="font-medium text-foreground">Treat the token as a password.</span>{" "}
+              It carries the client id and stays valid until it expires; generate a new one per
+              machine and revoke by rotating <code className="font-mono">SECRET_KEY</code>.
+            </div>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   )
 }

@@ -23,6 +23,10 @@ function formatDuration(ms: number): string {
     return `${sec}s`;
 }
 
+/** Ordered: everything at or below the active level is printed. */
+export const LOG_LEVELS = ["silent", "error", "warn", "info", "debug"] as const;
+export type LogLevel = (typeof LOG_LEVELS)[number];
+
 export interface TunnelStatsSnapshot {
     requests: number;
     httpRequests: number;
@@ -48,9 +52,29 @@ export class TunnelStats {
     private drawn = false;
     private readonly tty = !!process.stdout.isTTY;
 
+    // Logging and the live line are independent: silencing request logs still
+    // leaves the realtime counters on screen.
+    private level: LogLevel = "info";
+    private lineEnabled = true;
+
+    public setLevel(level?: string) {
+        if (level && (LOG_LEVELS as readonly string[]).includes(level)) {
+            this.level = level as LogLevel;
+        }
+    }
+
+    public setLineEnabled(enabled: boolean) {
+        this.lineEnabled = enabled;
+        if (!enabled) this.clear();
+    }
+
+    public enabled(level: LogLevel): boolean {
+        return LOG_LEVELS.indexOf(level) <= LOG_LEVELS.indexOf(this.level);
+    }
+
     /** Redraw once a second so the uptime clock stays alive between requests. */
     public start() {
-        if (!this.tty || this.timer) return;
+        if (!this.tty || !this.lineEnabled || this.timer) return;
         this.timer = setInterval(() => this.draw(), 1000);
         this.timer.unref?.();
     }
@@ -100,16 +124,31 @@ export class TunnelStats {
     }
 
     /** Log a line without leaving the status line duplicated above it. */
-    public log(message: string) {
+    public log(message: string, level: LogLevel = "info") {
+        if (!this.enabled(level)) return;
         this.clear();
         console.log(message);
         this.draw();
     }
 
     public error(message: string) {
+        if (!this.enabled("error")) return;
         this.clear();
         console.error(message);
         this.draw();
+    }
+
+    public warn(message: string) {
+        this.log(message, "warn");
+    }
+
+    /** Always shown (unless fully silent): the URL is the point of the command. */
+    public banner(message: string) {
+        this.log(message, "error");
+    }
+
+    public debug(message: string) {
+        this.log(`\x1b[90m${message}\x1b[0m`, "debug");
     }
 
     /** Final one-line summary, printed on shutdown. */
@@ -132,7 +171,7 @@ export class TunnelStats {
     }
 
     private draw() {
-        if (!this.tty) return;
+        if (!this.tty || !this.lineEnabled) return;
         const uptime = formatDuration(Date.now() - this.startedAt);
         const line =
             `\x1b[90m${uptime}\x1b[0m  ` +

@@ -70,7 +70,7 @@ bun add -g @cubetiq/hlt
 
 ```bash
 # 1. Initialize client config and acquire JWT token
-hlt init -s https://tunnel.example.com
+hlt init --server https://tunnel.example.com
 
 # 2. Forward local port 3000
 hlt start 3000

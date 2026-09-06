@@ -74,4 +74,22 @@ export const randomPort = () => {
   return Math.floor(Math.random() * 64511) + 1024;
 }
 
+/**
+ * Read the clientId out of a JWT without verifying it. Used only to name the
+ * tunnel when the token is passed with --token and no profile exists — the
+ * server re-verifies the signature and remains the authority on identity.
+ */
+export const decodeTokenClientId = (token?: string): string | null => {
+  if (!token) return null;
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const json = Buffer.from(payload, "base64url").toString("utf8");
+    const claims = JSON.parse(json);
+    return typeof claims?.clientId === "string" ? claims.clientId : null;
+  } catch {
+    return null;
+  }
+};
+
 export { addPrefixOnHttpSchema, generateUUID };

@@ -5,7 +5,7 @@ import * as os from "os";
 import * as path from "path";
 import { Socket, io } from "socket.io-client";
 import { TunnelRequest, TunnelResponse } from "./lib";
-import { addPrefixOnHttpSchema, generateUUID } from "./util";
+import { addPrefixOnHttpSchema, decodeTokenClientId, generateUUID } from "./util";
 
 import { PROFILE_DEFAULT, PROFILE_PATH, SERVER_DEFAULT_URL } from "./constant";
 import { ClientOptions, Options, TunnelConfig, TunnelGrant } from "./interface";
@@ -57,7 +57,19 @@ export class HttpTunnelClient implements Client {
     private endpoints: string[] = [];
     private tunnelConfig: TunnelConfig | null = null;
     private stats = new TunnelStats();
+    private servers: string[] = [];
+    private serverIndex = 0;
+    private signalsBound = false;
+    private lastPongAt = Date.now();
+    private connectFailures = 0;
 
+    /**
+     * Application-level heartbeat. Engine.io's own ping only proves the socket is
+     * open; this proves the server is still *answering*. A node that accepts the
+     * connection but has stopped serving (wedged event loop, half-open NAT
+     * mapping) is detected here and the socket is re-dialled — which, with more
+     * than one `--server`, is what moves the tunnel to another node.
+     */
     private keepAlive() {
         if (!this.socket) {
             return;
@@ -67,12 +79,49 @@ export class HttpTunnelClient implements Client {
             clearInterval(this.keepAliveTimer);
         }
 
+        const interval = this.keepAliveTimeout || 5000;
+        this.lastPongAt = Date.now();
+
         this.keepAliveTimer = setInterval(() => {
-            if (this.socket && this.socket.connected) {
-                this.socket.send("ping");
+            const socket = this.socket;
+            if (!socket || !socket.connected) return;
+
+            socket.send("ping");
+            const silentFor = Date.now() - this.lastPongAt;
+            if (silentFor > interval * 4) {
+                this.stats.warn(
+                    `\x1b[33m! server has not answered for ${Math.round(silentFor / 1000)}s — reconnecting\x1b[0m`
+                );
+                this.lastPongAt = Date.now();
+                this.nextServer("unresponsive server");
+                socket.disconnect().connect();
             }
-        }, this.keepAliveTimeout || 5000);
+        }, interval);
         this.keepAliveTimer.unref?.();
+    }
+
+    /**
+     * Point the manager at the next `--server` entry. Socket.IO reads the URI on
+     * every reconnection attempt, so this takes effect on the next retry without
+     * tearing anything else down.
+     */
+    private nextServer(reason: string) {
+        if (this.servers.length < 2 || !this.socket) return;
+        this.serverIndex = (this.serverIndex + 1) % this.servers.length;
+        const target = this.servers[this.serverIndex];
+        try {
+            const manager: any = this.socket.io;
+            const current = new URL(manager.uri);
+            const next = new URL(target);
+            // Keep the tunnel's own hostname label, swap the node behind it.
+            next.hostname = current.hostname.endsWith(next.hostname)
+                ? current.hostname
+                : next.hostname;
+            manager.uri = next.origin;
+            this.stats.warn(`\x1b[33m↻ failing over to ${next.origin} (${reason})\x1b[0m`);
+        } catch {
+            // A malformed alternate server is not worth killing the tunnel over.
+        }
     }
 
     // Init the Client for config file
@@ -145,7 +194,18 @@ export class HttpTunnelClient implements Client {
     public initStartClient = async (options: Options) => {
         const profile = options.profile || PROFILE_DEFAULT;
         const clientId = `${options.apiKey || options.clientId || generateUUID()}`;
-        const server = options.server || SERVER_DEFAULT_URL;
+
+        this.stats.setLevel(options.logLevel);
+        this.stats.setLineEnabled(options.stats !== false);
+
+        // `--server a,b,c`: the extra entries are failover targets, used when one
+        // node is unreachable or wedged.
+        this.servers = String(options.server || SERVER_DEFAULT_URL)
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+        if (this.servers.length === 0) this.servers = [SERVER_DEFAULT_URL];
+        const server = this.servers[this.serverIndex % this.servers.length];
 
         // The public name defaults to the client id, so a client always keeps
         // its own reserved subdomain unless it asks for something else.
@@ -209,7 +269,14 @@ export class HttpTunnelClient implements Client {
                 ...defaultParams,
                 os: osInfo,
             },
-            // reconnection: true,
+            // Survive server restarts and rolling deploys: retry forever with
+            // jittered backoff instead of giving up after the default 5 tries.
+            reconnection: true,
+            reconnectionAttempts: Infinity,
+            reconnectionDelay: 500,
+            reconnectionDelayMax: 10000,
+            randomizationFactor: 0.5,
+            timeout: 20000,
         };
 
         const http_proxy = process.env.https_proxy || process.env.http_proxy;
@@ -218,8 +285,14 @@ export class HttpTunnelClient implements Client {
         }
 
         // Connecting to socket server and agent here...
-        console.log(`client connecting to server: ${serverUrl}`);
+        this.stats.log(`client connecting to server: ${serverUrl}`);
         this.socket = io(serverUrl, initParams);
+
+        // The server answers our heartbeat with "pong"; that timestamp is what
+        // the stall detector in keepAlive() watches.
+        this.socket.on("message", (msg: any) => {
+            if (msg === "pong") this.lastPongAt = Date.now();
+        });
 
         const clientLogPrefix = `client: ${clientId} on profile: ${profile}`;
         const targetHost = options.host || "localhost";
@@ -241,7 +314,9 @@ export class HttpTunnelClient implements Client {
 
         this.socket.on("connect", () => {
             if (this.socket!.connected) {
-                console.log(`\x1b[32m✔ ${clientLogPrefix} is connected to server successfully!\x1b[0m`);
+                this.lastPongAt = Date.now();
+                this.connectFailures = 0;
+                this.stats.log(`\x1b[32m✔ ${clientLogPrefix} is connected to server successfully!\x1b[0m`);
             }
         });
 
@@ -253,25 +328,31 @@ export class HttpTunnelClient implements Client {
                 this.endpoint = grant.urls[0];
             }
             this.endpoints.forEach((url) => {
-                console.log(`\x1b[36m➜ Forwarding:\x1b[0m ${url} -> http://${localHost}`);
+                this.stats.banner(`\x1b[36m➜ Forwarding:\x1b[0m ${url} -> http://${localHost}`);
             });
             // Live status line last, so it stays pinned below the banner.
             this.stats.start();
         });
 
         this.socket.on("connect_error", (e) => {
-            console.error(
-                `${clientLogPrefix} connect error:`,
-                (e && e.message) || "something wrong"
-            );
-            if ((options as any).exitOnError !== false && e && e.message && e.message.startsWith("[40")) {
+            const message = (e && e.message) || "something wrong";
+            this.stats.error(`\x1b[31m✖ ${clientLogPrefix} connect error:\x1b[0m ${message}`);
+
+            // A rejection (4xx) is the server's verdict and retrying elsewhere
+            // will not change it; a transport failure is worth another node.
+            const rejected = message.startsWith("[40");
+            if (!rejected && ++this.connectFailures >= 3) {
+                this.connectFailures = 0;
+                this.nextServer("connection failures");
+            }
+            if ((options as any).exitOnError !== false && rejected) {
                 process.exit(1);
             }
         });
 
         this.socket.on("disconnect", (reason) => {
             this.stats.stop();
-            console.warn(`${clientLogPrefix} disconnected: ${reason}!`);
+            this.stats.warn(`${clientLogPrefix} disconnected: ${reason}!`);
             if (reason === "io server disconnect") {
                 if (this.keepAliveTimer) {
                     clearInterval(this.keepAliveTimer);
@@ -286,7 +367,7 @@ export class HttpTunnelClient implements Client {
 
         this.socket.on("disconnect_exit", (reason) => {
             this.stats.stop();
-            console.warn(`\x1b[33m${clientLogPrefix} disconnected and terminated: ${reason}!\x1b[0m`);
+            this.stats.warn(`\x1b[33m${clientLogPrefix} disconnected and terminated: ${reason}!\x1b[0m`);
             if (this.keepAliveTimer) {
                 clearInterval(this.keepAliveTimer);
                 this.keepAliveTimer = null;
@@ -556,62 +637,63 @@ export class HttpTunnelClient implements Client {
                 if (portStr) {
                     try {
                         options.port = parseInt(portStr);
-                        console.log(`default port: ${port} will be ignored and override by port: ${options.port}`);
                     } catch (e) {
                         options.port = port;
                     }
                 }
             } else {
                 options.port = port;
-                console.log(`default port: ${port} will be forwared`);
             }
         }
 
+        this.stats.setLevel(options.logLevel);
+
+        // CLI flags win over the stored profile, and a --server/--token pair is
+        // enough on its own: no `hlt init`, no profile file.
+        const cliServer = options.server;
+        const cliToken = options.token;
+        const standalone = !!(cliServer && cliToken);
+
         const configDir = path.resolve(os.homedir(), PROFILE_PATH);
-
-        if (!fs.existsSync(configDir)) {
-            fs.mkdirSync(configDir);
-        }
-
         let config: any = {};
         const configFilename = `${options.profile || PROFILE_DEFAULT}.json`;
         const configFilePath = path.resolve(configDir, configFilename);
 
         if (fs.existsSync(configFilePath)) {
             config = JSON.parse(fs.readFileSync(configFilePath, "utf8"));
-        } else {
+        } else if (!standalone) {
             if (options.autoinit) {
+                if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
                 await this.initConfigFile(options);
                 config = JSON.parse(fs.readFileSync(configFilePath, "utf8"));
             } else {
-                console.warn(`profile: ${options.profile || PROFILE_DEFAULT} not found!`);
+                this.stats.error(
+                    `\x1b[31m✖ profile '${options.profile || PROFILE_DEFAULT}' not found.\x1b[0m ` +
+                    `Run \x1b[1mhlt init\x1b[0m, or pass \x1b[1m--server <url> --token <jwt>\x1b[0m.`
+                );
                 return;
             }
         }
 
-        if (!config.server) {
-            config.server = SERVER_DEFAULT_URL;
-        }
+        options.server = cliServer || config.server || SERVER_DEFAULT_URL;
+        options.token = cliToken || config.token;
+        options.clientId = options.clientId || config.clientId;
+        options.apiKey = options.key || options.apiKey || config.apiKey;
 
-        if (!config.token) {
-            console.info(`please init or set token for ${config.server}`);
+        if (!options.token) {
+            this.stats.error(
+                `\x1b[31m✖ no token for ${options.server}.\x1b[0m ` +
+                `Run \x1b[1mhlt init --server ${options.server}\x1b[0m or pass \x1b[1m--token <jwt>\x1b[0m.`
+            );
             return;
         }
 
-        if (!config.clientId) {
-            if (!config.apiKey) {
-                console.info(`please init or create a client for ${config.server}`);
-            } else {
-                config.clientId = config.apiKey;
-            }
-            return;
+        if (!options.clientId) {
+            // The token carries the id the server will use; adopting it keeps the
+            // public URL stable across restarts when running from --token alone.
+            options.clientId =
+                decodeTokenClientId(options.token) || options.apiKey || generateUUID();
         }
-
-        // options.port = port;
-        options.token = config.token;
-        options.server = config.server;
-        options.clientId = config.clientId;
-        options.apiKey = options.key || config.apiKey;
 
         if (options.suffix === "port" || options.suffix === "true") {
             options.suffix = `${port}`;
@@ -636,7 +718,7 @@ export class HttpTunnelClient implements Client {
             this.socket = null;
             this.keepAliveTimer && clearInterval(this.keepAliveTimer);
 
-            console.log("client stopped from server:", this.endpoint);
+            this.stats.banner(`client stopped from server: ${this.endpoint}`);
         }
     };
 

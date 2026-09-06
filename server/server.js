@@ -56,6 +56,9 @@ io.engine.on("connection_error", (err) => {
 });
 
 // Redis Adapter & Telemetry Storage Setup
+// Set once Redis is connected; until then name claims fall back to the in-process
+// (or cluster-primary) registry.
+let redisClaims = null;
 const redisConfig = AppConfig.redis;
 if (redisConfig && redisConfig.enabled && redisConfig.url) {
   const pubClient = createClient({
@@ -77,6 +80,9 @@ if (redisConfig && redisConfig.enabled && redisConfig.url) {
     logger.info(`Redis adapter and telemetry connected: ${redisConfig.url}`);
     io.adapter(createAdapter(pubClient, subClient));
     stats.setRedisClient(pubClient);
+    // With Redis available, tunnel-name ownership moves out of process memory so
+    // a client keeps its URL across a restart or a move to another node.
+    redisClaims = new hostnames.RedisClaimRegistry(pubClient);
   }).catch((err) => {
     logger.error("Failed to connect to Redis:", err.message);
   });
@@ -104,6 +110,11 @@ const tunnelSockets = {};
 const aliasToPrimaryHost = new Map();
 // Set of active primary hosts
 const activePrimaryHosts = new Set();
+
+// Publish this process' live tunnel set to Redis under a short TTL, so "active
+// tunnels" is the union of nodes that are actually alive right now — a crashed
+// or restarted node's entries expire instead of lingering forever.
+stats.setNode(hostId, () => Array.from(activePrimaryHosts));
 
 function getSocketAliases(socket) {
   const aliases = new Set();
@@ -236,6 +247,12 @@ const localClaims = process.send ? null : new hostnames.ClaimRegistry();
 
 // Ask for names, all-or-nothing. Resolves { ok, names } | { ok: false, error }.
 function claimNames(names, clientId, socketId) {
+  // Redis first: it is the only authority that spans nodes and restarts.
+  if (redisClaims) {
+    return redisClaims
+      .claim(names, clientId, socketId)
+      .catch((e) => ({ ok: false, error: e.message || String(e) }));
+  }
   if (localClaims) {
     return Promise.resolve(localClaims.claim(names, clientId, socketId));
   }
@@ -247,7 +264,9 @@ function claimNames(names, clientId, socketId) {
 
 function releaseNames(names, socketId) {
   if (!names || names.length === 0) return;
-  if (localClaims) {
+  if (redisClaims) {
+    redisClaims.release(names).catch(() => {});
+  } else if (localClaims) {
     localClaims.release(names, socketId);
   } else {
     try {

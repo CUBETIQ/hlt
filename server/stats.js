@@ -12,6 +12,11 @@ const { EventEmitter } = require("events");
  * path — they are rare and carry membership (sAdd/sRem) that must not reorder.
  */
 const FLUSH_MS = parseInt(process.env.STATS_FLUSH_MS, 10) || 1000;
+const NODE_KEY_PREFIX = "hlt:stats:node:";
+const NODE_TTL_MS = parseInt(process.env.STATS_NODE_TTL_MS, 10) || 30000;
+// Per-host counters are live-tunnel data (client history is the durable record),
+// so they are refreshed while the tunnel is up and expire once it is gone.
+const HOST_TTL_MS = parseInt(process.env.STATS_HOST_TTL_MS, 10) || 24 * 60 * 60 * 1000;
 
 const emptyDelta = () => ({ http: 0, ws: 0, in: 0, out: 0 });
 const newPending = () => ({
@@ -29,6 +34,9 @@ class TelemetryManager extends EventEmitter {
     this.redisClient = null;
     this.flushMs = flushMs;
     this._timer = null;
+    this._nodeTimer = null;
+    this.nodeId = null;
+    this.getLiveHosts = null;
     this._pending = newPending();
     this.memoryStats = {
       global: {
@@ -69,6 +77,66 @@ class TelemetryManager extends EventEmitter {
 
   setRedisClient(client) {
     this.redisClient = client;
+    this._heartbeat();
+  }
+
+  /**
+   * Identify this process and how to ask it for its live tunnel hosts. Each node
+   * publishes that list under a short-lived key, so "active tunnels" is the union
+   * of what live nodes currently hold: a crashed or restarted node's entries
+   * simply expire instead of inflating the numbers forever (which a shared
+   * increment/decrement counter always does when a process dies mid-flight).
+   */
+  setNode(nodeId, getLiveHosts) {
+    this.nodeId = nodeId;
+    this.getLiveHosts = getLiveHosts;
+    this._heartbeat();
+  }
+
+  _publishNode() {
+    const redis = this._redis();
+    if (!redis || !this.nodeId || !this.getLiveHosts) return;
+    try {
+      const hosts = this.getLiveHosts() || [];
+      const multi = redis.multi();
+      multi.set(`${NODE_KEY_PREFIX}${this.nodeId}`, JSON.stringify(hosts), {
+        PX: NODE_TTL_MS,
+      });
+      // Keep live host counters alive and let orphans (from a killed process
+      // that never disconnected) expire on their own.
+      hosts.forEach((h) => multi.pExpire(`hlt:stats:hosts:${h}`, HOST_TTL_MS));
+      multi.exec().catch(() => {});
+    } catch {}
+  }
+
+  _heartbeat() {
+    if (this._nodeTimer || !this.nodeId || !this._redis()) return;
+    this._publishNode();
+    this._nodeTimer = setInterval(() => this._publishNode(), NODE_TTL_MS / 3);
+    this._nodeTimer.unref?.();
+  }
+
+  /** Live hosts across every node that has checked in recently. */
+  async _activeHosts(redis) {
+    try {
+      const keys = [];
+      // The namespace holds one key per running node, so this stays tiny.
+      for await (const key of redis.scanIterator({ MATCH: `${NODE_KEY_PREFIX}*`, COUNT: 100 })) {
+        keys.push(...(Array.isArray(key) ? key : [key]));
+      }
+      if (keys.length === 0) return [];
+      const rows = await redis.mGet(keys);
+      const hosts = new Set();
+      for (const row of rows) {
+        if (!row) continue;
+        try {
+          JSON.parse(row).forEach((h) => hosts.add(h));
+        } catch {}
+      }
+      return Array.from(hosts);
+    } catch {
+      return [];
+    }
   }
 
   _redis() {
@@ -169,8 +237,6 @@ class TelemetryManager extends EventEmitter {
         await redis
           .multi()
           .hIncrBy("hlt:stats:global", "total_connections", 1)
-          .hIncrBy("hlt:stats:global", "active_sockets", 1)
-          .sAdd("hlt:stats:active_hosts", host)
           .hSet(`hlt:stats:hosts:${host}`, {
             connected_at: now,
             client_id: String(clientId || "anonymous"),
@@ -184,6 +250,8 @@ class TelemetryManager extends EventEmitter {
       } catch (err) {
         // Ignore redis non-critical telemetry failure
       }
+      // Publish the new tunnel set straight away instead of waiting a tick.
+      this._publishNode();
     }
   }
 
@@ -204,11 +272,10 @@ class TelemetryManager extends EventEmitter {
         await redis
           .multi()
           .hIncrBy("hlt:stats:global", "total_disconnections", 1)
-          .hIncrBy("hlt:stats:global", "active_sockets", -1)
-          .sRem("hlt:stats:active_hosts", host)
           .del(`hlt:stats:hosts:${host}`)
           .exec();
       } catch (err) {}
+      this._publishNode();
     }
   }
 
@@ -332,13 +399,15 @@ class TelemetryManager extends EventEmitter {
         this.flush();
         const [redisGlobal, activeHosts] = await Promise.all([
           redis.hGetAll("hlt:stats:global"),
-          redis.sMembers("hlt:stats:active_hosts"),
+          this._activeHosts(redis),
         ]);
         const totalConn = parseInt(redisGlobal.total_connections, 10) || 0;
         const totalDisc = parseInt(redisGlobal.total_disconnections, 10) || 0;
         const totalHttp = parseInt(redisGlobal.total_http_requests, 10) || 0;
         const totalWs = parseInt(redisGlobal.total_ws_requests, 10) || 0;
-        const activeSockets = parseInt(redisGlobal.active_sockets, 10) || 0;
+        // Derived from live node heartbeats, never from a shared counter: a node
+        // that dies without decrementing must not leave phantom tunnels behind.
+        const activeSockets = activeHosts.length;
         const bytesIn = parseInt(redisGlobal.total_bytes_in, 10) || 0;
         const bytesOut = parseInt(redisGlobal.total_bytes_out, 10) || 0;
         return {

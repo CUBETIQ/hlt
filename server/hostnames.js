@@ -163,6 +163,68 @@ class ClaimRegistry {
   }
 }
 
+/**
+ * Redis-backed registry: the same contract as ClaimRegistry, but shared by every
+ * node. This is what lets a client keep its public URL when it reconnects to a
+ * different server than the one it left, and across a full restart.
+ *
+ * A claim is `hlt:claim:<name> = clientId` with the TTL acting as the grace
+ * period. Held names are persisted (no TTL) while the owner is connected and get
+ * the TTL back on release, so an owner that disappears frees its name on time.
+ *
+ * ponytail: SET NX + GET compare, not a Lua CAS. The race window is one round
+ * trip and the loser sees "already taken"; move to a script if that ever bites.
+ */
+class RedisClaimRegistry {
+  constructor(redis, ttlMs = tunnelConfig.claim_ttl_ms) {
+    this.redis = redis;
+    this.ttlMs = ttlMs;
+    this.key = (name) => `hlt:claim:${name}`;
+  }
+
+  async claim(names, clientId, socketId) {
+    const owner = String(clientId || `socket:${socketId}`);
+    const granted = [];
+
+    for (const name of names) {
+      if (granted.includes(name)) continue;
+      const key = this.key(name);
+      try {
+        const ok = await this.redis.set(key, owner, { NX: true });
+        if (!ok) {
+          const held = await this.redis.get(key);
+          if (held && held !== owner) {
+            return { ok: false, error: `'${name}' is already taken` };
+          }
+        }
+        // Held names never expire while their owner is connected.
+        await this.redis.persist(key);
+        granted.push(name);
+      } catch (err) {
+        return { ok: false, error: `claim store unavailable: ${err.message}` };
+      }
+    }
+
+    if (granted.length === 0) return { ok: false, error: "no usable name requested" };
+    return { ok: true, names: granted };
+  }
+
+  async release(names) {
+    for (const name of names || []) {
+      const key = this.key(name);
+      try {
+        if (this.ttlMs <= 0) {
+          await this.redis.del(key);
+        } else {
+          await this.redis.pExpire(key, this.ttlMs);
+        }
+      } catch {
+        // The TTL will not be refreshed; the name frees itself either way.
+      }
+    }
+  }
+}
+
 module.exports = {
   isEnabled,
   buildHost,
@@ -171,6 +233,7 @@ module.exports = {
   normalizeName,
   validateName,
   ClaimRegistry,
+  RedisClaimRegistry,
   tunnelConfig,
   reservedSet,
 };
