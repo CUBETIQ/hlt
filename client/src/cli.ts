@@ -18,7 +18,7 @@ const packageInfo = require("../package.json");
 program
   .name("hlt")
   .description(
-    "CUBETIQ HTTP tunnel client for fast, scalable, and secure local tunneling"
+    "Cubis's HTTP tunnel client for fast, scalable, and secure local tunneling"
   )
   .version(`v${packageInfo.version}`);
 
