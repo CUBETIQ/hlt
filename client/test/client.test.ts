@@ -1,7 +1,9 @@
 import { describe, test, expect, afterAll } from "bun:test";
+import { EventEmitter } from "events";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { TunnelRequest, TunnelResponse } from "../src/lib";
 import { HltClient, getToken, SERVER_DEFAULT_URL } from "../src/index";
 import { createFileServer } from "../src/serve";
 import { decodeTokenClientId } from "../src/util";
@@ -38,6 +40,43 @@ describe("HLT Client SDK", () => {
     expect(decodeTokenClientId(`header.${payload}.sig`)).toBe("acme");
     expect(decodeTokenClientId("not-a-jwt")).toBeNull();
     expect(decodeTokenClientId(undefined)).toBeNull();
+  });
+});
+
+describe("tunnel streams", () => {
+  // A visitor aborting mid-response makes the server destroy its side, which
+  // arrives here as an error. Without a listener that is an unhandled 'error'
+  // event and it takes the whole CLI process down.
+  const mockSocket = () => {
+    const socket: any = new EventEmitter();
+    socket.id = "mock";
+    socket.connected = true;
+    socket.io = { engine: new EventEmitter() };
+    return socket;
+  };
+
+  test("a remote error destroys the response without throwing", () => {
+    const socket = mockSocket();
+    const response = new TunnelResponse(socket, "req-1");
+
+    expect(() => response.handleError("Response closed prematurely")).not.toThrow();
+    expect(response.destroyed).toBe(true);
+  });
+
+  test("a remote error destroys the request without throwing", () => {
+    const socket = mockSocket();
+    const request = new TunnelRequest(socket, "req-2");
+
+    expect(() => request.handleError("Response closed prematurely")).not.toThrow();
+    expect(request.destroyed).toBe(true);
+  });
+
+  test("dispatches a remote error through the socket manager", () => {
+    const socket = mockSocket();
+    const response = new TunnelResponse(socket, "req-3");
+
+    expect(() => socket.emit("response-pipe-error", "req-3", "boom")).not.toThrow();
+    expect(response.destroyed).toBe(true);
   });
 });
 

@@ -40,20 +40,30 @@ function writeCache(latest: string) {
  * Look up the published version, at most once a day. Never throws and never
  * blocks the tunnel: the caller fires it and forgets.
  */
-export async function checkForUpdate(currentVersion: string): Promise<string | null> {
-    if (process.env.HLT_NO_UPDATE_CHECK === "1" || process.env.CI) return null;
+export async function checkForUpdate(
+    currentVersion: string,
+    options: { force?: boolean } = {}
+): Promise<string | null> {
+    // `force` is the explicit `hlt upgrade`: always ask the registry, and ignore
+    // the opt-outs meant for the passive daily check.
+    if (!options.force && (process.env.HLT_NO_UPDATE_CHECK === "1" || process.env.CI)) {
+        return null;
+    }
 
     const cached = readCache();
-    if (cached && Date.now() - cached.checkedAt < CHECK_INTERVAL_MS) {
+    if (!options.force && cached && Date.now() - cached.checkedAt < CHECK_INTERVAL_MS) {
         return isNewer(cached.latest, currentVersion) ? cached.latest : null;
     }
 
     try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 2500);
+        // Plain JSON: the abbreviated "vnd.npm.install-v1+json" type is only
+        // accepted on the full packument, and the registry answers 406 for it
+        // here — which silently disabled every update check.
         const res = await fetch(REGISTRY, {
             signal: controller.signal,
-            headers: { accept: "application/vnd.npm.install-v1+json" },
+            headers: { accept: "application/json" },
         });
         clearTimeout(timer);
         if (!res.ok) return null;
@@ -65,6 +75,27 @@ export async function checkForUpdate(currentVersion: string): Promise<string | n
     } catch {
         return null;
     }
+}
+
+/**
+ * Where this copy of the CLI actually lives at runtime.
+ *
+ * Not `__dirname`: the bundler inlines it as a build-time constant (the author's
+ * source directory), so it says nothing about the installed location.
+ */
+export function runtimeDir(): string {
+    const entry = process.argv[1] || require.main?.filename || "";
+    return entry ? path.dirname(entry) : "";
+}
+
+/**
+ * True when this process is the copy npx unpacked into its own cache. A global
+ * install would not change what `npx @cubetiq/hlt` runs next time, so upgrading
+ * has to be reported differently.
+ */
+export function isNpxRuntime(): boolean {
+    const dir = runtimeDir();
+    return dir.split(path.sep).includes("_npx");
 }
 
 /** The manager that most likely installed this binary. */
@@ -91,23 +122,49 @@ export function upgradeCommand(): { cmd: string; args: string[] } {
 }
 
 export function updateBanner(latest: string, current: string): string {
-    const { cmd, args } = upgradeCommand();
+    const how = isNpxRuntime()
+        ? `\x1b[1mnpx -y ${PACKAGE_NAME}@latest <command>\x1b[0m \x1b[90m(you are running via npx)\x1b[0m`
+        : `\x1b[1mhlt upgrade\x1b[0m`;
     return (
         `\x1b[33m┌ Update available\x1b[0m ${current} → \x1b[32m${latest}\x1b[0m\n` +
-        `\x1b[33m└ Run\x1b[0m \x1b[1mhlt upgrade\x1b[0m \x1b[90m(${cmd} ${args.join(" ")})\x1b[0m`
+        `\x1b[33m└ Run\x1b[0m ${how}`
     );
 }
 
 /** Run the upgrade in place, streaming the package manager's own output. */
 export function runUpgrade(): Promise<number> {
+    // npx runs a version-pinned copy out of its own cache; installing globally
+    // would leave `npx @cubetiq/hlt` on the old one, which looks like "upgrade
+    // did nothing".
+    if (isNpxRuntime()) {
+        console.log(
+            `\x1b[33m! This copy was unpacked by npx (${runtimeDir()}).\x1b[0m\n` +
+            `  npx keeps its own cache, so a global install would not change what you run.\n` +
+            `  Use \x1b[1mnpx -y ${PACKAGE_NAME}@latest <command>\x1b[0m to always get the newest,\n` +
+            `  or install it once with \x1b[1m${upgradeCommand().cmd} ${upgradeCommand().args.join(" ")}\x1b[0m and run \x1b[1mhlt\x1b[0m directly.`
+        );
+        return Promise.resolve(0);
+    }
+
     const { cmd, args } = upgradeCommand();
     console.log(`\x1b[36m➜ Upgrading:\x1b[0m ${cmd} ${args.join(" ")}`);
     return new Promise((resolve) => {
         const child = spawn(cmd, args, { stdio: "inherit", shell: process.platform === "win32" });
         child.on("error", (err) => {
-            console.error(`\x1b[31m✖ Upgrade failed:\x1b[0m ${err.message}`);
+            console.error(
+                `\x1b[31m✖ Upgrade failed:\x1b[0m ${err.message}\n` +
+                `  Run it yourself: \x1b[1m${cmd} ${args.join(" ")}\x1b[0m`
+            );
             resolve(1);
         });
-        child.on("close", (code) => resolve(code ?? 0));
+        child.on("close", (code) => {
+            if (code) {
+                console.error(
+                    `\x1b[31m✖ ${cmd} exited with code ${code}.\x1b[0m` +
+                    (cmd === "npm" ? " A global install may need sudo, or use a node version manager." : "")
+                );
+            }
+            resolve(code ?? 0);
+        });
     });
 }

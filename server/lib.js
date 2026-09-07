@@ -1,15 +1,50 @@
 const { Writable, Duplex } = require("stream");
 
-// writeBuffer holds *packets*, not bytes: the old 64K threshold could never be
-// reached, so every write completed immediately and a slow client buffered
-// without bound. 32 queued frames is roughly 2MB at our chunk sizes.
-const DRAIN_THRESHOLD = 32; // queued engine.io packets before applying backpressure
-const DRAIN_TIMEOUT = 5000; // 5s safety timeout to prevent drain hangs
+// Backpressure is measured in bytes handed to engine.io, not in queued packets:
+// every multiplexed request shares one socket, so a packet-count threshold made
+// hundreds of concurrent requests wait on a drain round-trip each (seconds of
+// added latency under load).
+const HIGH_WATER_BYTES =
+  parseInt(process.env.HLT_SOCKET_HIGH_WATER, 10) || 4 * 1024 * 1024;
+const DRAIN_TIMEOUT = 5000; // safety net if the transport never reports a drain
+
+// Keyed by engine.io connection, so a reconnect starts clean.
+const connStates = new WeakMap();
+
+function connState(conn) {
+  let state = connStates.get(conn);
+  if (!state) {
+    state = { bytes: 0, waiters: [] };
+    connStates.set(conn, state);
+    // engine.io drains its whole write buffer at once, so this is the point
+    // where everything we counted has actually gone out.
+    conn.on("drain", () => {
+      state.bytes = 0;
+      const waiting = state.waiters;
+      state.waiters = [];
+      for (const resume of waiting) resume();
+    });
+  }
+  return state;
+}
+
+function byteSize(args) {
+  let total = 0;
+  for (const arg of args) {
+    if (!arg) continue;
+    if (Buffer.isBuffer(arg)) total += arg.length;
+    else if (typeof arg === "string") total += Buffer.byteLength(arg);
+    else if (Array.isArray(arg)) {
+      for (const chunk of arg) total += (chunk && (chunk.length || chunk.byteLength)) || 0;
+    }
+  }
+  return total;
+}
 
 /**
- * Helper to safely write/emit to a Socket.io socket with backpressure.
- * Prevents memory bloat while avoiding the `socket.conn.once("drain")` deadlock
- * when the Engine.io writeBuffer is already empty.
+ * Emit, and only make the caller wait when the socket is genuinely behind.
+ * Counting our own bytes is O(1) per write; summing engine.io's queue would be
+ * O(queue length) on every chunk.
  */
 function safeEmitWithDrain(socket, event, ...args) {
   const callback = typeof args[args.length - 1] === "function" ? args.pop() : null;
@@ -18,22 +53,28 @@ function safeEmitWithDrain(socket, event, ...args) {
   if (!callback) return;
 
   const conn = socket.conn;
-  if (conn && conn.writeBuffer && conn.writeBuffer.length > DRAIN_THRESHOLD) {
-    let called = false;
-    let timer = null;
-
-    const done = () => {
-      if (called) return;
-      called = true;
-      if (timer) clearTimeout(timer);
-      callback();
-    };
-
-    timer = setTimeout(done, DRAIN_TIMEOUT);
-    conn.once("drain", done);
-  } else {
+  if (!conn) {
     process.nextTick(callback);
+    return;
   }
+
+  const state = connState(conn);
+  state.bytes += byteSize(args);
+  if (state.bytes <= HIGH_WATER_BYTES) {
+    process.nextTick(callback);
+    return;
+  }
+
+  let called = false;
+  const done = () => {
+    if (called) return;
+    called = true;
+    clearTimeout(timer);
+    callback();
+  };
+  const timer = setTimeout(done, DRAIN_TIMEOUT);
+  timer.unref?.();
+  state.waiters.push(done);
 }
 
 /**

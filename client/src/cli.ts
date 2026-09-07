@@ -56,6 +56,21 @@ const tunnelArgs = (options: any) => ({
     : undefined,
 });
 
+/**
+ * Last resort for the CLI process only (never installed by the SDK, which must
+ * not hijack a host app's error handling). A tunnel that stays up after one
+ * aborted request is worth far more than a clean stack trace: streams torn down
+ * by a visitor disconnecting used to reach the top level and exit the process.
+ */
+function installCrashGuard() {
+    const report = (kind: string, err: any) => {
+        const message = err?.stack || err?.message || String(err);
+        console.error(`\x1b[31m✖ ${kind}:\x1b[0m ${message}\n\x1b[90m  recovered — the tunnel is still running\x1b[0m`);
+    };
+    process.on("uncaughtException", (err) => report("uncaught exception", err));
+    process.on("unhandledRejection", (err) => report("unhandled rejection", err));
+}
+
 /** Non-blocking: never delays the tunnel, never fails the command. */
 const noticeUpdate = (options: any) => {
   if (options.updateCheck === false) return;
@@ -118,6 +133,7 @@ tunnelOptions(
     "preserve"
   )
   .action((portOrAddress, options) => {
+    installCrashGuard();
     noticeUpdate(options);
     startClient({
       port: portOrAddress,
@@ -172,6 +188,7 @@ tunnelOptions(
       );
       if (options.local) return;
 
+      installCrashGuard();
       noticeUpdate(options);
       startClient({
         port,
@@ -184,13 +201,20 @@ tunnelOptions(
 program
   .command("upgrade")
   .description("upgrade the hlt cli to the latest published version")
-  .action(async () => {
-    const latest = await checkForUpdate(packageInfo.version);
-    if (!latest) {
+  .option("-f, --force", "reinstall even when already up to date", false)
+  .action(async (options) => {
+    // Always hit the registry here: the cached daily answer is for the passive
+    // banner, and using it made `hlt upgrade` report "up to date" wrongly.
+    const latest = await checkForUpdate(packageInfo.version, { force: true });
+    if (!latest && !options.force) {
       console.log(`\x1b[32m✔ hlt v${packageInfo.version} is up to date.\x1b[0m`);
       return;
     }
-    console.log(`hlt v${packageInfo.version} → \x1b[32mv${latest}\x1b[0m`);
+    console.log(
+      latest
+        ? `hlt v${packageInfo.version} → \x1b[32mv${latest}\x1b[0m`
+        : `Reinstalling hlt v${packageInfo.version}`
+    );
     process.exit(await runUpgrade());
   });
 
@@ -209,6 +233,7 @@ tunnelOptions(
 
     const profile = options.profile || "webhook";
     console.log(`Start webhook: ${port} via hlt client with profile: ${profile}`);
+    installCrashGuard();
     noticeUpdate(options);
     startClient({
       port,

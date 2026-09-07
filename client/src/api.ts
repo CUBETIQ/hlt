@@ -535,7 +535,21 @@ export class HttpTunnelClient implements Client {
 
                 localRes.pipe(tunnelResponse);
 
+                // If the visitor goes away mid-response the server destroys its
+                // side; stop pulling from the local app instead of leaving the
+                // connection open (under load these pile up fast).
+                let completed = false;
+                const abortLocal = () => {
+                    if (completed) return;
+                    completed = true;
+                    localRes.destroy();
+                    localReq.destroy();
+                };
+                tunnelResponse.once("error", abortLocal);
+                tunnelResponse.once("close", abortLocal);
+
                 localRes.once("end", () => {
+                    completed = true;
                     const duration = Date.now() - startTime;
                     const status = localRes.statusCode || 200;
                     const statusStr = colorStatus(status);
